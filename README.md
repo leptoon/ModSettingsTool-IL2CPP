@@ -61,11 +61,8 @@ game-specific is committed.
 
    The DLL is written to `build/ModSettingsTool.dll`.
 
-Two helper scripts are included:
-
-- `scripts/deploy-to-game.sh` builds Release and copies the DLL into your game's plugins folder, then
-  verifies the deployed bytes with md5.
-- `scripts/package-release.sh` builds Release and assembles the distributable zip under `dist/`.
+The `scripts/deploy-to-game.sh` helper builds Release and copies the DLL into your game's plugins folder,
+then verifies the deployed bytes with md5.
 
 For the BepInEx config API the mod is built on and the in-game UI surface it hooks, see [`docs/`](docs/).
 

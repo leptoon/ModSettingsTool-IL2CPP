@@ -1,0 +1,19 @@
+<!--
+  Copy this file to `local.props` (same folder) and set the path below to your game's BepInEx
+  directory. `local.props` is gitignored, so your machine-specific path is never committed.
+
+  ModSettingsToolRefDir must point at the BepInEx folder inside your Supermarket Simulator install,
+  the one that contains both `core/` and `interop/`. The build reads the BepInEx and game interop
+  DLLs from there (see Directory.Build.props and src/ModSettingsTool/ModSettingsTool.csproj).
+
+  Typical locations:
+    Windows: C:\Program Files (x86)\Steam\steamapps\common\Supermarket Simulator\BepInEx
+    Linux:   /home/<you>/.local/share/Steam/steamapps/common/Supermarket Simulator/BepInEx
+
+  Build the game once with Tobey's BepInEx Pack (IL2CPP) installed so `core/` and `interop/` exist.
+-->
+<Project>
+  <PropertyGroup>
+    <ModSettingsToolRefDir>/path/to/Supermarket Simulator/BepInEx</ModSettingsToolRefDir>
+  </PropertyGroup>
+</Project>

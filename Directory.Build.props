@@ -1,0 +1,26 @@
+<Project>
+
+  <!--
+    Repo-wide MSBuild defaults for the Mod Settings Tool BepInEx 6 / IL2CPP plugin build.
+
+    Imported automatically by every project under the repo root (MSBuild walks up the directory tree for
+    Directory.Build.props). Its job is to resolve the per-machine reference / output paths so no absolute,
+    machine-specific path is ever committed.
+
+    Resolution order for $(ModSettingsToolRefDir) (points at <game>/BepInEx, which holds both core/ and
+    interop/):
+      1. a gitignored `local.props` at the repo root (the local dev box), then
+      2. the MODSETTINGSTOOL_REF_DIR environment variable (CI / headless convenience), then
+      3. a non-existent placeholder so the project still evaluates with the references simply unresolved
+         until one of the above supplies the real dir.
+  -->
+
+  <Import Project="$(MSBuildThisFileDirectory)local.props"
+          Condition="Exists('$(MSBuildThisFileDirectory)local.props')" />
+
+  <PropertyGroup>
+    <ModSettingsToolRefDir Condition="'$(ModSettingsToolRefDir)' == '' and '$(MODSETTINGSTOOL_REF_DIR)' != ''">$(MODSETTINGSTOOL_REF_DIR)</ModSettingsToolRefDir>
+    <ModSettingsToolRefDir Condition="'$(ModSettingsToolRefDir)' == ''">$(MSBuildThisFileDirectory)__set_ModSettingsToolRefDir_in_local.props__</ModSettingsToolRefDir>
+  </PropertyGroup>
+
+</Project>

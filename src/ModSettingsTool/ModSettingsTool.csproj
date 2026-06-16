@@ -1,0 +1,112 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Mod Settings Tool, the single-assembly BepInEx 6 / IL2CPP plugin.
+    References resolve from $(ModSettingsToolRefDir) (the game's BepInEx dir), set per-machine in the
+    gitignored local.props (see Directory.Build.props). <Private>false</Private> keeps the player's DLLs
+    out of the build output. Output lands in <repo>/build.
+
+    The reference set mirrors the RDC Stock Manager mod's: the BepInEx core (chainloader + config
+    reflection, the heart of this mod), Harmony, Il2CppInterop, and the game uGUI/TMP/Localization
+    interop the settings UI clones (the same proven cloning surface).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ModSettingsTool</AssemblyName>
+    <RootNamespace>ModSettingsTool</RootNamespace>
+    <Product>Mod Settings Tool</Product>
+    <Version>0.1.0</Version>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- CS1591: no XML doc gen. CS0436: the source nullable-attribute shim (Compat/NullableAttributesShim.cs)
+         intentionally shadows Il2Cppmscorlib's broken copies. -->
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <ModSettingsToolOutputDir Condition="'$(ModSettingsToolOutputDir)' == ''">$(MSBuildThisFileDirectory)../../build</ModSettingsToolOutputDir>
+    <OutputPath>$(ModSettingsToolOutputDir)</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx 6 IL2CPP core (BepInEx/core/). BepInEx.Core carries the Chainloader<TPlugin> base
+         (Plugins / DependencyErrors) and the Configuration types (ConfigFile/ConfigEntryBase) this mod
+         reflects over; BepInEx.Unity.IL2CPP carries IL2CPPChainloader + BasePlugin. -->
+    <Reference Include="BepInEx.Core">
+      <HintPath>$(ModSettingsToolRefDir)/core/BepInEx.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP">
+      <HintPath>$(ModSettingsToolRefDir)/core/BepInEx.Unity.IL2CPP.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx.Unity.Common">
+      <HintPath>$(ModSettingsToolRefDir)/core/BepInEx.Unity.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- SemanticVersioning: the type of BepInPlugin.Version (read for each mod's display version). -->
+    <Reference Include="SemanticVersioning">
+      <HintPath>$(ModSettingsToolRefDir)/core/SemanticVersioning.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Harmony (IL2CPP build, bundled in BepInEx 6) -->
+    <Reference Include="0Harmony">
+      <HintPath>$(ModSettingsToolRefDir)/core/0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Il2CppInterop runtime (Il2CppObjectBase, ClassInjector, DelegateSupport, etc.) -->
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(ModSettingsToolRefDir)/core/Il2CppInterop.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.Common">
+      <HintPath>$(ModSettingsToolRefDir)/core/Il2CppInterop.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Generated interop wrappers (BepInEx/interop/), UNPREFIXED, except the .NET BCL. -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(ModSettingsToolRefDir)/interop/Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(ModSettingsToolRefDir)/interop/UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- uGUI components the settings UI clones: Toggle / Slider / Button / Image / GridLayoutGroup /
+         ScrollRect (UnityEngine.UI) and Canvas / CanvasGroup (UnityEngine.UIModule). -->
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(ModSettingsToolRefDir)/interop/UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(ModSettingsToolRefDir)/interop/UnityEngine.UIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- TextMeshPro: the cloned labels / dropdowns / input fields (TextMeshProUGUI / TMP_Dropdown /
+         TMP_InputField). -->
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(ModSettingsToolRefDir)/interop/Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- LocalizeStringEvent (UnityEngine.Localization.Components): disabled on cloned controls so the
+         game's localization stops overwriting our labels. -->
+    <Reference Include="Unity.Localization">
+      <HintPath>$(ModSettingsToolRefDir)/interop/Unity.Localization.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- UnityEngine.Input hotkeys (no BepInEx KeyboardShortcut in this pack). -->
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(ModSettingsToolRefDir)/interop/UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2Cppmscorlib">
+      <HintPath>$(ModSettingsToolRefDir)/interop/Il2Cppmscorlib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSystem">
+      <HintPath>$(ModSettingsToolRefDir)/interop/Il2CppSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,40 @@
+# Mod Settings Tool .gitignore (BepInEx 6 / IL2CPP plugin repo).
+
+# Per-machine MSBuild overrides for the BepInEx pack reference paths.
+local.props
+
+# .NET build output (unanchored: catches src/<project>/bin|obj).
+[Bb]in/
+[Oo]bj/
+
+# Build + release landing zones (regenerable; latest artifact only, never audited or preserved).
+/build/
+/dist/
+
+# Reference / interop tree, if a contributor copies the game's BepInEx/core/ + interop/ DLLs into the
+# repo instead of pointing $(ModSettingsToolRefDir) at the game install. Player- and game-version-specific
+# binaries; never committed.
+/BepInEx/
+
+# Decompiled game / BepInEx corpus (regenerate with ilspycmd; never committed).
+/.gamedump/
+
+# Local agent instructions and session artifacts. Not published.
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Root-level npm / tooling noise.
+/node_modules/
+/package.json
+/package-lock.json
+
+# IDE / OS noise.
+.vs/
+.idea/
+*.user
+*.suo
+*.DotSettings.user
+*~
+*.swp
+.DS_Store

@@ -26,13 +26,12 @@ IL2CPPChainloader.Instance                       // static, set during chainload
 `BepInEx.Unity.IL2CPP.BasePlugin` → `.Config : ConfigFile`, `.Log : ManualLogSource`.
 
 **Note:** `BepInPlugin.Version` is a `SemanticVersioning.Version` (in `core/SemanticVersioning.dll`), the
-csproj references that assembly so the property can be read. The BepInEx log is at
-`BepInEx.Paths.BepInExRootPath` + `/LogOutput.log`.
+csproj references that assembly so the property can be read.
 
-**Health model (this mod):** loaded set = `Plugins`; failures = `DependencyErrors` (a failed plugin is
-NOT in `Plugins`, so most errors become their own red entries); optional heuristic = scan `LogOutput.log`
-for `[Error … : <source>]` lines and attribute to a mod by Name. See `Mods/ModRegistry.cs` +
-`Mods/ModHealth.cs`.
+**Health model (this mod):** binary, load-only. Loaded set = `Plugins` (green); failures =
+`DependencyErrors` (red): a failed plugin is NOT in `Plugins`, so most errors become their own red entries.
+There is no warning tier and no log scan; a loaded mod stays green even if it logged errors at runtime, and
+a config-read failure leaves it green with "No settings to change." See `Mods/ModRegistry.cs`.
 
 ## 2. Reflect a mod's config
 
@@ -87,3 +86,22 @@ and BepInEx writes it through to the `.cfg`. So a mod that reads its config each
 Manager) picks up the change with no coupling, and mods that subscribe to `SettingChanged` are notified.
 Hand-writing the `.cfg` file would NOT update the live entry (no reload), so the owning mod would not see
 it, and would overwrite our edit on its next save. Always drive the entry.
+
+## 5. ConfigurationManagerAttributes (de-facto metadata)
+
+A mod can attach a `ConfigurationManagerAttributes` object to an entry via `ConfigDescription.Tags`. There
+is no shared type for it, so `Config/ConfigBinding.cs` matches the class by NAME and reads its public
+fields by reflection (fail-soft: any missing field is simply unspecified). Honored fields:
+
+| Field | Effect in the Mods tab |
+|---|---|
+| `DispName` (string) | display label override (falls back to the key) |
+| `Category` (string) | a sub-header grouping within a section |
+| `Order` (int) | sort within a section (higher = earlier) |
+| `IsAdvanced` (bool) | folded into the bottom "Advanced Settings" group |
+| `Browsable` (bool) | `false` also folds into "Advanced" |
+| `ReadOnly` (bool) | the control is shown but disabled (and not reset by Reset all) |
+| `HideDefaultButton` (bool) | hide the per-setting reset button |
+
+Surface-everything: nothing here removes a setting. Advanced and non-browsable entries are collected into a
+collapsed "Advanced Settings" container at the bottom of the page, never hidden outright.

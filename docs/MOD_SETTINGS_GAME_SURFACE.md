@@ -1,14 +1,15 @@
 # Game UI surface: Mod Settings Tool
 
 > The game UI this mod binds to. FLUID living document: REPLACE stale lines as the surface is mapped;
-> never append dated addenda. The Escape-menu tab surface is **proven** (inherited from the RDC Stock
-> Manager mod). The **Main Menu** surface is now **mapped** (§C, via the read-only spike).
+> never append dated addenda. The Settings "Mods" tab is **proven** in both the store Escape menu (§B,
+> inherited from the RDC Stock Manager mod) and the main-menu Settings window (§B2). The **Main Menu**
+> installed-mod list surface is **mapped** (§C, via the read-only spike).
 
 ## A. Scenes
 
 | Scene | Role | This mod |
 |---|---|---|
-| `Main Menu` | the main menu | **Part 1**, the installed-mod list (surface PROVEN, see §C) |
+| `Main Menu` | the main menu | **Part 1**, the installed-mod list (§C) **+ Part 2**, the "Mods" tab in the main-menu Settings window (§B2) |
 | `Main Scene` | singleplayer store | **Part 2**, the Escape-menu "Mods" tab (surface PROVEN, see §B) |
 | `Multiplayer` | co-op | inert |
 
@@ -45,6 +46,25 @@ row, the dropdown's item-template Toggle is a 0-width trap).
 with a staged Save / Discard / Cancel model and a close-guard on the Escape-menu close path
 (`SettingsMenuManager.set_Enable`) for keybind-capture and unsaved edits.
 
+### B2. Main-menu Settings tab (PROVEN, same machinery)
+
+The main-menu Settings window is the SAME `SettingsMenuManager` as the store's, only the way you reach it
+differs, so the identical clone-tab recipe injects the "Mods" tab there too:
+
+```
+FindObjectOfType<MainMenuManager>()              // GameSingletons.Get<MainMenuManager>(); see §C
+  .m_SettingsMenu      : SettingsMenuManager      // same type the store reaches via EscapeMenuManager.settingsMenu
+    .m_tabManager      : TabManager   (.m_Tabs / .OpenTab, as §B)
+  .Settings()                                      // opens the settings window
+```
+
+`ModsTab.FindSettingsManager()` picks the store vs menu `SettingsMenuManager` by scene (`PatchGate.InStore`
+→ `EscapeMenuManager.Instance.settingsMenu`; `PatchGate.InMenu` → `MainMenuManager.m_SettingsMenu`) and
+`TryBuild(SettingsMenuManager)` clones into whichever is active. The Host drives the build + `Tick()` in
+BOTH scenes, and because `set_Enable` is on the shared `SettingsMenuManager`, the existing open-build and
+unsaved-close patches cover the menu too (gated to `PatchGate.Active()`). Per-scene `ModsTab.Invalidate()`
+resets the built panel/taskbar state, so the menu and store each build their own clone.
+
 ## C. Main Menu (PROVEN, mapped by the spike)
 
 Reached WITHOUT `GameObject.Find` literals, via the menu controller:
@@ -78,7 +98,7 @@ Build recipe for `UI/MainMenuModList.cs`:
   Place the list panel center-anchored at x ≳ +200 (tune at smoke), occupying the vertical band y≈[+136,−436].
 - **Clone-source for a row label:** a landing button's child `Text (TMP)` (a `TextMeshProUGUI`). **Disable its
   `LocalizeStringEvent`** on the clone (else the game's localization overwrites our text), the same hazard
-  handled for the tab, then set text + color (green = Healthy / amber = Warning / red = Unhealthy).
+  handled for the tab, then set text + color (binary load health: green = loaded / red = failed to load).
 - **Overflow:** the menu has clonable `ScrollRect`s (`Menu/LoadPanel`, `Road Map BG/Scroll View`); wrap the
   list in one when it exceeds the band (dozens of mods / low resolution).
 
@@ -98,10 +118,16 @@ control, each persistent-listener-safe (`UI/UiListeners.cs`) and staged (written
   field, so one is cloned from any loaded `TMP_InputField` (`Resources.FindObjectsOfTypeAll`) to get a real
   caret/selection. That source is non-deterministic, so `NormalizeClonedInput` forces a flat rectangle,
   drops the placeholder, disables every other graphic (legacy `Text`/`Image` stepper "+/-" included) and
-  resets the kept text's transform scale (kills a mirrored duplicate). `TextInput` rows also show a colour
-  swatch (`ColorUtility.TryParseHtmlString` + rgb/csv).
-- **KeyBind**: a press-a-key keycap capture (reads `UnityEngine.Input`; no IMGUI). Esc cancels the capture
-  without closing Settings; mouse buttons + Esc are excluded via `IsBindable`.
+  resets the kept text's transform scale (kills a mirrored duplicate). A colour-valued `TextInput` gets a
+  collapsible colour editor instead (a live swatch + R/G/B/A sliders + hex field, collapsed by default
+  behind the colour row); a plain `TextInput` shows a small swatch when its value parses as a colour
+  (`ColorUtility.TryParseHtmlString` + rgb/csv).
+- **KeyBind**: a press-a-key keycap capture (reads `UnityEngine.Input`; no IMGUI), only for a real
+  `UnityEngine.KeyCode` setting (incl. IL2CPP-wrapped variants). Esc cancels the capture without closing
+  Settings; mouse buttons + Esc are excluded via `IsBindable`.
+- The right pane groups settings into collapsible sections (a "Debug" section is pinned last), with a
+  per-mod header, per-mod search, a per-setting reset + modified marker, and an "Advanced Settings" group
+  for advanced / non-browsable entries. Author-declared order by default, alphabetical optional.
 
 Every edit writes `ConfigBinding.Value` (the live `ConfigEntry.BoxedValue`), only on Save. The Escape-menu
 close path is guarded in `Patches/MenuPatches.cs` (`SettingsMenuManager.set_Enable`).

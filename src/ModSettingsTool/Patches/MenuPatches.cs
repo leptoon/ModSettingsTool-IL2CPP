@@ -39,7 +39,7 @@ namespace ModSettingsTool.Patches
         {
             try
             {
-                if (!value && PatchGate.InStore() && !UI.ModsTab.OnSettingsClosing()) return false;
+                if (!value && PatchGate.Active() && !UI.ModsTab.OnSettingsClosing()) return false;
             }
             catch (Exception ex)
             {
@@ -58,7 +58,7 @@ namespace ModSettingsTool.Patches
         {
             try
             {
-                if (value && PatchGate.InStore()) UI.ModsTab.Poll();
+                if (value && PatchGate.Active()) UI.ModsTab.Poll();
             }
             catch (Exception ex)
             {

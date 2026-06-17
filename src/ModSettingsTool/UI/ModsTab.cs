@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using ModSettingsTool.Config;
 using ModSettingsTool.Mods;
+using ModSettingsTool.Patches;
 using TMPro;
 using UnityEngine;
 using UnityEngine.Localization.Components;
@@ -31,6 +33,8 @@ namespace ModSettingsTool.UI
         private static TextMeshProUGUI? _labelTemplate;
         private static GameObject? _refToggle, _refSlider, _refDropdown, _refInput;
         private static Transform? _rightContent;
+        private static Transform? _leftContent;      // the mod-list pane content (for our custom wheel scrolling)
+        private static Transform? _controlParent;   // where a setting's control(s) parent (its setting block); falls back to _rightContent
         private static ModInfo? _selected;   // selected mod by INSTANCE, unloaded-failure rows share an empty GUID
         private static readonly List<ModButton> _modButtons = new();
 
@@ -42,7 +46,35 @@ namespace ModSettingsTool.UI
 
         // Staged edits, controls write HERE, never to the live ConfigEntry, until the player Saves. This is
         // what guarantees nothing persists without Save, and makes Discard a clean no-op (live was untouched).
-        private static readonly Dictionary<ConfigBinding, Action> _staged = new();
+        // Apply runs on Save; Effective is the value the entry WILL hold after Apply (kept so the "modified"
+        // marker can compare a staged value against the default without touching the live entry).
+        private sealed class StagedEdit
+        {
+            public Action Apply = null!;
+            public object? Effective;
+        }
+        private static readonly Dictionary<ConfigBinding, StagedEdit> _staged = new();
+
+        // Per-row widgets for the live "modified" marker + per-row reset, plus a Snap that visually restores the
+        // control to its default (used by reset). Rebuilt with each page; keyed by binding instance.
+        private sealed class RowUi
+        {
+            public GameObject? Dot;    // the accent "modified" dot (shown when live-or-staged != default)
+            public GameObject? Reset;  // the per-row "Reset" button (shown when modified, honoring HideDefaultButton/ReadOnly)
+            public Action? Snap;       // set the control to its default value WITHOUT notifying (no stage)
+        }
+        private static readonly Dictionary<ConfigBinding, RowUi> _rows = new();
+
+        // Tier 3 navigation/density state (per selected mod; reset on mod switch). The search box is PERSISTENT
+        // (it lives in the right slot, outside the rebuilt scroll content) so live-filtering keeps focus + caret.
+        private static TMP_InputField? _searchField;                 // the persistent per-mod search box
+        private static string _filter = "";                          // current search query (empty = show all)
+        private static bool _filterDirty;                            // a keystroke queued a rebuild for the next Tick
+        private static string _filterPending = "";                  // the query to apply on that deferred rebuild
+        private static readonly HashSet<string> _collapsedSections = new(StringComparer.OrdinalIgnoreCase); // folded section names
+        private static bool _advancedExpanded;                       // the bottom Advanced container's fold state (default collapsed)
+        private static int _zebra;                                   // running row index for the alternating row band
+
         private static GameObject? _modal;
         private static Action? _backAction;   // the window Back button's original action (closes the settings)
         private static GameObject? _builtPanel;     // our cloned Mods-tab panel (kept for runtime teardown)
@@ -58,9 +90,13 @@ namespace ModSettingsTool.UI
         {
             public TMP_Dropdown Dd = null!;
             public ConfigBinding B = null!;
-            public float Until;   // unscaled-time deadline: keep re-applying options until then, to outlast the game's late re-init
         }
 
+        // The current page's dropdowns, kept healthy for as long as they live (until the page rebuilds and they
+        // are destroyed). The game's CustomDropdown re-initialises AFTER we build, and, on the main-menu
+        // settings window, can do so well after any fixed timeout, blanking our options back to "Option A"; the
+        // per-frame Tick re-applies them whenever it sees them blanked (and the dropdown is closed). No deadline:
+        // a deadline that expired before the game's late re-init was what left a stale, stuck "Option A" dropdown.
         private static readonly List<PendingDropdown> _pendingDropdowns = new();
 
         // Reset so the tab rebuilds against a fresh scene's UI tree (called by the Host on scene change).
@@ -72,10 +108,20 @@ namespace ModSettingsTool.UI
             _labelTemplate = null;
             _refToggle = _refSlider = _refDropdown = null;
             _rightContent = null;
+            _leftContent = null;
+            _controlParent = null;
             _selected = null;
             _modButtons.Clear();
             _pendingDropdowns.Clear();
             _staged.Clear();
+            _rows.Clear();
+            _searchField = null;
+            _filter = "";
+            _filterDirty = false;
+            _filterPending = "";
+            _collapsedSections.Clear();
+            _advancedExpanded = false;
+            _zebra = 0;
             _backAction = null;
             _modal = null;
             _capturing = null;
@@ -113,17 +159,37 @@ namespace ModSettingsTool.UI
         {
             try
             {
-                if (!EscapeMenuManager.HasInstance) return;
-                EscapeMenuManager menu = EscapeMenuManager.Instance;
-                if (menu == null) return;
-                SettingsMenuManager? sm = menu.settingsMenu;
+                SettingsMenuManager? sm = FindSettingsManager();
                 if (sm == null || sm.gameObject == null) return;
-                TryBuild(menu);
+                TryBuild(sm);
             }
             catch
             {
                 // fail-soft; the main-menu list does not depend on this
             }
+        }
+
+        // The Settings window hosting our tab differs by scene but is the SAME SettingsMenuManager type either
+        // way: in the store it hangs off the Escape menu; on the main menu it hangs off MainMenuManager. Both
+        // expose m_tabManager, so TryBuild clones into either identically.
+        private static SettingsMenuManager? FindSettingsManager()
+        {
+            try
+            {
+                if (PatchGate.InStore())
+                {
+                    if (!EscapeMenuManager.HasInstance) return null;
+                    EscapeMenuManager menu = EscapeMenuManager.Instance;
+                    return menu != null ? menu.settingsMenu : null;
+                }
+                if (PatchGate.InMenu())
+                {
+                    MainMenuManager? mm = GameSingletons.Get<MainMenuManager>();
+                    return mm != null ? mm.m_SettingsMenu : null;
+                }
+            }
+            catch { }
+            return null;
         }
 
         // Per-frame (called by the Host every frame in the store). Cheap when idle; only does work while a
@@ -134,18 +200,24 @@ namespace ModSettingsTool.UI
             // CustomDropdown's own init (it otherwise shows a stale "Option 1" until the page is rebuilt).
             if (_pendingDropdowns.Count > 0)
             {
-                float now = Time.unscaledTime;
                 for (int i = _pendingDropdowns.Count - 1; i >= 0; i--)
                 {
                     PendingDropdown pd = _pendingDropdowns[i];
-                    if (pd.Dd == null) { _pendingDropdowns.RemoveAt(i); continue; }
-                    // Re-apply ONLY while the game's CustomDropdown re-init has blanked our options back to
-                    // "Option 1"; once they hold (and keep holding through the window) we leave the control
-                    // alone, so we never fight a dropdown the player has opened or changed.
-                    if (!DropdownApplied(pd.Dd, pd.B)) ApplyDropdown(pd.Dd, pd.B);
-                    if (now >= pd.Until) _pendingDropdowns.RemoveAt(i);
+                    if (pd.Dd == null) { _pendingDropdowns.RemoveAt(i); continue; } // destroyed on a page rebuild
+                    // NEVER touch a dropdown the player has opened, re-applying options calls Hide() and would
+                    // slam shut the popup they just clicked open, which reads as "the dropdown won't open on the
+                    // first click." While it's expanded the options are already ours (it can't have been blanked
+                    // and stay open), so skip; heal it whenever it is closed and the game has blanked our options.
+                    bool expanded = false;
+                    try { expanded = pd.Dd.IsExpanded; } catch { }
+                    if (!expanded && !DropdownApplied(pd.Dd, pd.B)) ApplyDropdown(pd.Dd, pd.B);
                 }
             }
+
+            // A queued search keystroke rebuilds the page here (out of the input's onValueChanged), then refocuses.
+            if (_filterDirty) ApplyPendingFilter();
+
+            WheelScroll();
 
             if (_capturing == null) return;
 
@@ -177,12 +249,10 @@ namespace ModSettingsTool.UI
             return true;
         }
 
-        private static void TryBuild(EscapeMenuManager menu)
+        private static void TryBuild(SettingsMenuManager settings)
         {
             try
             {
-                if (menu == null) return;
-                SettingsMenuManager? settings = menu.settingsMenu;
                 if (settings == null) return;
                 TabManager? tabs = settings.m_tabManager;
                 if (tabs == null || tabs.transform == null) return;
@@ -295,11 +365,25 @@ namespace ModSettingsTool.UI
                 Transform leftSlot = MakeSlot(content, "MST LeftSlot", 0f, 0.34f);
                 Transform rightSlot = MakeSlot(content, "MST RightSlot", 0.35f, 1f);
 
-                Transform leftContent = UiBuild.BuildVerticalScroll(template, leftSlot, new Color(0f, 0f, 0f, 0.50f));
-                _rightContent = UiBuild.BuildVerticalScroll(template, rightSlot, new Color(0f, 0f, 0f, 0.40f));
+                Transform leftContent = UiBuild.BuildVerticalScroll(template, leftSlot, UiTheme.LeftPaneBg);
+                _leftContent = leftContent;
+
+                // Right side (Tier 3): a persistent search strip pinned to the top, then the scrollable config
+                // page filling the rest. The search box lives OUTSIDE the rebuilt scroll content so live-filtering
+                // never destroys the field mid-keystroke (it keeps focus + caret).
+                const float searchH = 42f;
+                GameObject scrollHost = UiBuild.NewRect("MST RightScrollHost", rightSlot);
+                RectTransform scrt = scrollHost.GetComponent<RectTransform>();
+                if (scrt != null) { scrt.anchorMin = Vector2.zero; scrt.anchorMax = Vector2.one; scrt.offsetMin = Vector2.zero; scrt.offsetMax = new Vector2(0f, -searchH); }
+                _rightContent = UiBuild.BuildVerticalScroll(template, scrollHost.transform, UiTheme.PaneBg);
+
+                GameObject searchHost = UiBuild.NewRect("MST SearchHost", rightSlot);
+                RectTransform sehrt = searchHost.GetComponent<RectTransform>();
+                if (sehrt != null) { sehrt.anchorMin = new Vector2(0f, 1f); sehrt.anchorMax = new Vector2(1f, 1f); sehrt.pivot = new Vector2(0.5f, 1f); sehrt.sizeDelta = new Vector2(0f, searchH); sehrt.anchoredPosition = Vector2.zero; }
+                BuildSearchField(searchHost.transform);
                 Plugin.Logger.LogDebug("[ModsTab] two-pane scaffold built; populating the mod list.");
 
-                UiBuild.MakeLabel(template, leftContent, $"Installed Mods ({ModRegistry.Cache.Count})", new Color(0.93f, 0.93f, 0.93f, 1f), 18f, false, false);
+                UiBuild.MakeLabel(template, leftContent, $"Installed Mods ({ModRegistry.Cache.Count})", UiTheme.TitleText, 20f, false, false);
                 foreach (ModInfo mod in ModRegistry.Cache) AddModButton(leftContent, mod);
                 UiBuild.ResetScrollAndRefreshHint(leftContent); // left list is static after this, top + evaluate its hint
 
@@ -315,7 +399,7 @@ namespace ModSettingsTool.UI
         {
             try
             {
-                GameObject go = UiBuild.MakeLabel(_labelTemplate!, parent, "  " + mod.Name, HealthPalette.For(mod.Health), 16f, true, true);
+                GameObject go = UiBuild.MakeLabel(_labelTemplate!, parent, "  " + mod.Name, HealthPalette.For(mod.Health), 18f, true, true);
                 go.name = "MST Mod " + mod.Name;
 
                 LayoutElement le = go.GetComponent<LayoutElement>();
@@ -356,6 +440,16 @@ namespace ModSettingsTool.UI
         private static void DoSelect(ModInfo mod)
         {
             _selected = mod;
+            // A new mod has different sections, reset the per-mod search + collapse state and clear the box.
+            _filter = "";
+            _filterDirty = false;
+            _filterPending = "";
+            _collapsedSections.Clear();
+            // Debug sections render at the bottom and start COLLAPSED, pre-seed them into the collapsed set (the
+            // user can still expand one; that's remembered until the next mod switch).
+            try { foreach (ConfigBinding cb in mod.Settings) if (IsDebugSection(cb.Section)) _collapsedSections.Add(cb.Section ?? ""); } catch { }
+            _advancedExpanded = false;
+            try { _searchField?.SetTextWithoutNotify(""); } catch { }
             foreach (ModButton mb in _modButtons)
             {
                 if (mb.Label == null) continue;
@@ -372,48 +466,373 @@ namespace ModSettingsTool.UI
             _capturing = null;
             _capturingLabel = null;
             ClearChildren(_rightContent);
+            _rows.Clear();
+            _pendingDropdowns.Clear(); // the previous page's dropdowns are being destroyed; this page re-adds its own
+            _zebra = 0;
 
             // Page-scoped delegate roots: clear the previous mod's right-pane handlers (its controls were just
             // destroyed) and collect this page's into the page scope, so browsing mods doesn't leak them.
+            _controlParent = _rightContent;
             UiListeners.BeginPageScope();
             try
             {
-                string ver = string.IsNullOrEmpty(mod.Version) ? "" : $"  v{mod.Version}";
-                UiBuild.MakeLabel(_labelTemplate, _rightContent, mod.Name + ver, new Color(0.96f, 0.96f, 0.96f, 1f), 20f, true, false);
-                if (!string.IsNullOrEmpty(mod.Guid))
-                    UiBuild.MakeLabel(_labelTemplate, _rightContent, mod.Guid, new Color(0.80f, 0.80f, 0.80f, 1f), 12f, true, false);
-                if (mod.Health != HealthStatus.Healthy && !string.IsNullOrEmpty(mod.IssueSummary))
-                    UiBuild.MakeLabel(_labelTemplate, _rightContent, mod.IssueSummary, HealthPalette.For(mod.Health), 14f, true, false);
+                BuildHeaderCard(mod);
+                if (!mod.HasSettings) return; // the header card already shows "No settings to change."
 
-                if (!mod.HasSettings)
+                // Tier 3 search: filter to the matching settings. With a filter active, sections render expanded
+                // (so matches aren't hidden in a folded section); with no filter, the remembered collapse state
+                // applies. Staged edits survive a filtered rebuild (they key on ConfigBinding, not the GameObject).
+                bool filtering = !string.IsNullOrEmpty(_filter);
+                List<ConfigBinding> visible = filtering ? FilterSettings(mod.Settings, _filter) : mod.Settings;
+                if (filtering && visible.Count == 0)
                 {
-                    UiBuild.MakeLabel(_labelTemplate, _rightContent, "No settings to change.", new Color(0.82f, 0.82f, 0.82f, 1f), 16f, true, false);
+                    UiBuild.MakeLabel(_labelTemplate, _rightContent, $"No settings match \"{_filter}\".", UiTheme.DimText, 16f, true, false);
                     return;
                 }
 
-                string lastSection = "\0";
-                bool firstHeader = true;
-                foreach (ConfigBinding b in mod.Settings)
+                List<SectionGroup> groups = OrderForDisplay(visible);
+
+                // Normal (non-advanced) settings of NON-Debug sections: one collapsible titled section per BepInEx
+                // section (sections in display order; entries ordered within). Each setting becomes a block (control
+                // + meta + optional description). A section whose every entry is advanced gets no card, those live
+                // in the Advanced container below. Debug sections are deferred to the very bottom (step 3).
+                foreach (SectionGroup g in groups)
                 {
-                    if (b.Section != lastSection)
+                    if (IsDebugSection(g.Section)) continue;
+                    if (g.Normal.Count == 0) continue;
+                    string sectionKey = g.Section ?? "";
+                    string title = string.IsNullOrEmpty(sectionKey) ? "General" : sectionKey;
+                    RenderCollapsibleSection(sectionKey, title, g.Normal, filtering);
+                }
+
+                // Advanced / non-browsable settings across every NON-Debug section collect into one collapsible
+                // "Advanced Settings" container (default collapsed), surfaced, never hidden. Grouped by their origin
+                // section (a sub-header per contributing named section) so context isn't lost. (Debug-section
+                // settings are NOT pulled in here, a Debug section stays whole at the bottom.)
+                int advCount = 0;
+                foreach (SectionGroup g in groups) if (!IsDebugSection(g.Section)) advCount += g.Advanced.Count;
+                if (advCount > 0)
+                {
+                    bool advExpanded = filtering || _advancedExpanded;
+                    Transform advBody = UiBuild.MakeAdvancedContainer(_labelTemplate, _rightContent, advCount, advExpanded, exp =>
                     {
-                        lastSection = b.Section;
-                        if (!string.IsNullOrEmpty(b.Section))
-                        {
-                            if (!firstHeader) UiBuild.MakeSeparator(_rightContent); // subtle divider between sections
-                            firstHeader = false;
-                            GameObject sec = UiBuild.MakeLabel(_labelTemplate, _rightContent, b.Section, new Color(0.78f, 0.86f, 1f, 1f), 15f, true, false);
-                            try { TextMeshProUGUI? st = sec.GetComponent<TextMeshProUGUI>(); if (st != null) st.fontStyle = FontStyles.Bold; } catch { }
-                        }
+                        _advancedExpanded = exp;
+                        UiBuild.RefreshScrollHint(_rightContent);
+                    });
+                    foreach (SectionGroup g in groups)
+                    {
+                        if (IsDebugSection(g.Section)) continue;
+                        if (g.Advanced.Count == 0) continue;
+                        if (!string.IsNullOrEmpty(g.Section)) UiBuild.MakeSubHeader(_labelTemplate, advBody, g.Section);
+                        foreach (ConfigBinding b in g.Advanced) AddSetting(b, advBody);
                     }
-                    AddControl(b);
+                }
+
+                // Debug section(s) at the VERY bottom, below Advanced, collapsed by default (pre-seeded in
+                // DoSelect). Each keeps ALL its settings together (normal + advanced), never split into Advanced.
+                foreach (SectionGroup g in groups)
+                {
+                    if (!IsDebugSection(g.Section)) continue;
+                    var all = new List<ConfigBinding>(g.Normal);
+                    all.AddRange(g.Advanced);
+                    if (all.Count == 0) continue;
+                    string sectionKey = g.Section ?? "";
+                    RenderCollapsibleSection(sectionKey, sectionKey, all, filtering);
                 }
             }
             finally
             {
+                _controlParent = _rightContent;
                 UiListeners.EndPageScope();
-                UiBuild.ResetScrollAndRefreshHint(_rightContent); // page just (re)built, scroll to its header + refresh hint
+                UiBuild.ResetScrollAndRefreshHint(_rightContent); // page just (re)built, scroll to top + refresh the hint
             }
+        }
+
+        // A "Debug" section is always pushed to the very bottom (below Advanced) and collapsed by default, its
+        // contents are diagnostics most players never touch. Matched by name containing "debug" (case-insensitive),
+        // so "Debug", "Debugging", "Debug Tools" all qualify.
+        private static bool IsDebugSection(string? section)
+            => !string.IsNullOrEmpty(section) && section!.IndexOf("debug", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        // Render one collapsible titled section (header + body card) holding `entries`, grouped by their
+        // ConfigurationManagerAttributes Category (a sub-header per category). Collapse state is remembered in
+        // _collapsedSections (a filter forces expand so matches aren't hidden). Shared by the normal + Debug paths.
+        private static void RenderCollapsibleSection(string sectionKey, string title, List<ConfigBinding> entries, bool filtering)
+        {
+            bool expanded = filtering || !_collapsedSections.Contains(sectionKey);
+            Transform body = UiBuild.MakeCollapsibleSection(_labelTemplate!, _rightContent!, title, expanded, exp =>
+            {
+                if (exp) _collapsedSections.Remove(sectionKey); else _collapsedSections.Add(sectionKey);
+                UiBuild.RefreshScrollHint(_rightContent);
+            });
+
+            string lastCat = "\0";
+            foreach (ConfigBinding b in entries)
+            {
+                string cat = b.Category ?? "";
+                if (!string.Equals(cat, lastCat, StringComparison.Ordinal))
+                {
+                    lastCat = cat;
+                    if (!string.IsNullOrEmpty(cat)) UiBuild.MakeSubHeader(_labelTemplate!, body, cat);
+                }
+                AddSetting(b, body);
+            }
+        }
+
+        // A section's entries split into normal + advanced, for one section card.
+        private sealed class SectionGroup
+        {
+            public readonly string Section;
+            public readonly List<ConfigBinding> Normal = new();
+            public readonly List<ConfigBinding> Advanced = new();
+            public SectionGroup(string section) { Section = section; }
+        }
+
+        // Group a mod's settings into ordered section cards. Base order = the [UI] SettingOrder key (author
+        // declaration order, the binding list's insertion order, or alphabetical). Sections appear in
+        // first-appearance order over that base. Within a section, the ConfigurationManagerAttributes Order
+        // (higher = earlier) is applied as a STABLE overlay so unordered entries keep the base order.
+        private static List<SectionGroup> OrderForDisplay(List<ConfigBinding> settings)
+        {
+            var groups = new List<SectionGroup>();
+            try
+            {
+                bool alpha = false;
+                try { alpha = Plugin.Settings.SettingOrder.Value == SettingOrderMode.Alphabetical; } catch { }
+
+                var baseSeq = new List<ConfigBinding>(settings);
+                if (alpha)
+                    baseSeq.Sort((x, y) =>
+                    {
+                        int c = string.Compare(x.Section, y.Section, StringComparison.OrdinalIgnoreCase);
+                        return c != 0 ? c : string.Compare(x.DisplayName, y.DisplayName, StringComparison.OrdinalIgnoreCase);
+                    });
+
+                var index = new Dictionary<string, SectionGroup>(StringComparer.OrdinalIgnoreCase);
+                foreach (ConfigBinding b in baseSeq)
+                {
+                    string sec = b.Section ?? "";
+                    if (!index.TryGetValue(sec, out SectionGroup? g)) { g = new SectionGroup(sec); groups.Add(g); index[sec] = g; }
+                    if (b.IsAdvanced) g.Advanced.Add(b); else g.Normal.Add(b);
+                }
+
+                foreach (SectionGroup g in groups)
+                {
+                    ApplyOrderOverlay(g.Normal);
+                    ApplyOrderOverlay(g.Advanced);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[ModsTab] ordering failed; using raw order: {ex.Message}");
+                if (groups.Count == 0)
+                {
+                    var g = new SectionGroup("");
+                    g.Normal.AddRange(settings);
+                    groups.Add(g);
+                }
+            }
+            return groups;
+        }
+
+        // Stable sort by ConfigurationManagerAttributes Order, descending (higher = earlier); ties keep the base
+        // order (LINQ OrderByDescending is a stable sort). Entries without Order all sort as 0.
+        private static void ApplyOrderOverlay(List<ConfigBinding> list)
+        {
+            if (list.Count < 2) return;
+            var sorted = list.OrderByDescending(b => b.Order ?? 0).ToList();
+            list.Clear();
+            list.AddRange(sorted);
+        }
+
+        // The per-mod header: a title card with name + version, the GUID, a health banner with the issue text
+        // when not healthy, and the settings count (or the "No settings to change." note for a config-less mod).
+        private static void BuildHeaderCard(ModInfo mod)
+        {
+            Transform card = UiBuild.MakeCard(_rightContent!, UiTheme.HeaderCardBg);
+
+            string ver = string.IsNullOrEmpty(mod.Version) ? "" : $"   v{mod.Version}";
+            GameObject name = UiBuild.MakeLabel(_labelTemplate!, card, mod.Name + ver, UiTheme.TitleText, 27f, true, false);
+            try { TextMeshProUGUI? nt = name.GetComponent<TextMeshProUGUI>(); if (nt != null) nt.fontStyle = FontStyles.Bold; } catch { }
+
+            if (!string.IsNullOrEmpty(mod.Guid))
+                UiBuild.MakeLabel(_labelTemplate!, card, mod.Guid, UiTheme.FaintText, 14f, true, false);
+
+            if (mod.Health != HealthStatus.Healthy && !string.IsNullOrEmpty(mod.IssueSummary))
+                UiBuild.MakeBanner(_labelTemplate!, card, mod.IssueSummary, UiTheme.Health(mod.Health), UiTheme.HealthBanner(mod.Health));
+
+            string count = mod.HasSettings
+                ? $"{mod.Settings.Count} setting{(mod.Settings.Count == 1 ? "" : "s")}"
+                : "No settings to change.";
+            UiBuild.MakeLabel(_labelTemplate!, card, count, UiTheme.DimText, 15f, true, false);
+
+            // Page-level "Reset all to defaults" (staged like any edit; Discard reverts, Save persists). Only
+            // when the mod has settings; hidden for a config-less mod.
+            if (mod.HasSettings)
+                AddResetAllButton(card);
+        }
+
+        // A muted "Reset all to defaults" button in the header card, stages a reset for EVERY setting (visible
+        // or in a collapsed group); Discard reverts, Save persists.
+        private static void AddResetAllButton(Transform card)
+        {
+            try
+            {
+                GameObject row = UiBuild.NewRect("MST ResetAll", card);
+                LayoutElement le = row.AddComponent<LayoutElement>();
+                if (le != null) { le.minHeight = 34f; le.preferredHeight = 34f; le.flexibleWidth = 1f; }
+
+                GameObject box = UiBuild.NewRect("Box", row.transform);
+                RectTransform brt = box.GetComponent<RectTransform>();
+                if (brt != null) { brt.anchorMin = new Vector2(0f, 0.12f); brt.anchorMax = new Vector2(0f, 0.88f); brt.pivot = new Vector2(0f, 0.5f); brt.sizeDelta = new Vector2(220f, 0f); brt.anchoredPosition = new Vector2(2f, 0f); }
+                Image img = box.AddComponent<Image>();
+                if (img != null) { img.color = new Color(0.55f, 0.33f, 0.30f, 0.55f); img.raycastTarget = true; }
+                Button btn = box.AddComponent<Button>();
+
+                GameObject lbl = UiBuild.MakeLabel(_labelTemplate!, box.transform, "Reset all to defaults", UiTheme.LabelText, 14f, false, false);
+                RectTransform lrt = lbl.GetComponent<RectTransform>();
+                if (lrt != null) { lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.offsetMin = Vector2.zero; lrt.offsetMax = Vector2.zero; }
+                TextMeshProUGUI? lt = lbl.GetComponent<TextMeshProUGUI>();
+                if (lt != null) lt.alignment = TextAlignmentOptions.Center;
+
+                UiListeners.OnClick(btn, ResetAll);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] reset-all button failed: {ex.Message}"); }
+        }
+
+        private static void ResetAll()
+        {
+            try
+            {
+                if (_selected == null) return;
+                foreach (ConfigBinding b in _selected.Settings) if (CanReset(b)) StageReset(b);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] reset all failed: {ex.Message}"); }
+        }
+
+        // A binding may be reset only when the UI can actually edit it: NOT ReadOnly (a protected entry whose
+        // control is disabled) and NOT Unsupported (rendered read-only via AddReadOnly, a type we can't
+        // render/edit). Both the per-row Reset (its visibility) and Reset-all use this, so neither path can stage
+        // a reset that Save would then write through BoxedValue for an entry the UI never exposed for editing.
+        private static bool CanReset(ConfigBinding b) => !b.ReadOnly && b.Kind != ControlKind.Unsupported && b.HasDefault;
+
+        // Stage restoring this entry's default (a no-op if live already equals default) and snap the control to
+        // show it. StageOrClear refreshes the row marker; the live entry is untouched until Save.
+        private static void StageReset(ConfigBinding b)
+        {
+            try
+            {
+                StageOrClear(b, !ValuesEqual(b.Value, b.Default), b.Default, b.ResetToDefault);
+                if (_rows.TryGetValue(b, out RowUi? r)) { try { r.Snap?.Invoke(); } catch { } }
+            }
+            catch { }
+        }
+
+        // Wrap one binding in a setting block: its control, then a compact meta line (modified dot + default /
+        // bounds + per-row Reset), then its wrapped description. The block sizes to its contents.
+        private static void AddSetting(ConfigBinding b, Transform sectionBody)
+        {
+            Transform block = UiBuild.MakeSettingBlock(sectionBody, (_zebra++ & 1) == 1); // subtle alternating band (Tier 3)
+            var row = new RowUi();
+            _rows[b] = row;
+            _controlParent = block;
+            try
+            {
+                AddControl(b);
+                if (b.ReadOnly) DisableInteractables(block);
+                AddMetaLine(b, block, row);
+                if (ShowDescriptionsEnabled() && !string.IsNullOrEmpty(b.Description))
+                    UiBuild.MakeDescription(_labelTemplate!, block, b.Description);
+                UpdateMarker(b); // initial dot/reset state (a row may already differ from default)
+            }
+            finally
+            {
+                _controlParent = _rightContent;
+            }
+        }
+
+        // The compact secondary line under a control: a "modified" dot (left), the default value + acceptable
+        // bounds (dim), and a per-row "Reset" button (right). Dot + Reset are toggled by UpdateMarker.
+        private static void AddMetaLine(ConfigBinding b, Transform block, RowUi row)
+        {
+            try
+            {
+                GameObject meta = UiBuild.NewRect("MST Meta " + b.Key, block);
+                LayoutElement le = meta.AddComponent<LayoutElement>();
+                if (le != null) { le.minHeight = 22f; le.preferredHeight = 22f; le.flexibleWidth = 1f; }
+
+                GameObject dot = UiBuild.NewRect("Dot", meta.transform);
+                RectTransform drt = dot.GetComponent<RectTransform>();
+                if (drt != null) { drt.anchorMin = drt.anchorMax = new Vector2(0f, 0.5f); drt.pivot = new Vector2(0f, 0.5f); drt.sizeDelta = new Vector2(9f, 9f); drt.anchoredPosition = new Vector2(9f, 0f); }
+                Image dimg = dot.AddComponent<Image>();
+                if (dimg != null) { dimg.color = UiTheme.Accent; dimg.raycastTarget = false; }
+                dot.SetActive(false);
+                row.Dot = dot;
+
+                GameObject lbl = UiBuild.MakeLabel(_labelTemplate!, meta.transform, MetaText(b), UiTheme.FaintText, 13f, false, false);
+                RectTransform lrt = lbl.GetComponent<RectTransform>();
+                if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(1f, 1f); lrt.offsetMin = new Vector2(24f, 0f); lrt.offsetMax = new Vector2(-86f, 0f); }
+                TextMeshProUGUI? lt = lbl.GetComponent<TextMeshProUGUI>();
+                if (lt != null) { lt.alignment = TextAlignmentOptions.MidlineLeft; try { lt.overflowMode = TextOverflowModes.Ellipsis; } catch { } }
+
+                GameObject rst = UiBuild.NewRect("Reset", meta.transform);
+                RectTransform rrt = rst.GetComponent<RectTransform>();
+                if (rrt != null) { rrt.anchorMin = rrt.anchorMax = new Vector2(1f, 0.5f); rrt.pivot = new Vector2(1f, 0.5f); rrt.sizeDelta = new Vector2(76f, 20f); rrt.anchoredPosition = new Vector2(-6f, 0f); }
+                Image rimg = rst.AddComponent<Image>();
+                if (rimg != null) { rimg.color = new Color(1f, 1f, 1f, 0.10f); rimg.raycastTarget = true; }
+                Button rbtn = rst.AddComponent<Button>();
+                GameObject rlbl = UiBuild.MakeLabel(_labelTemplate!, rst.transform, "Reset", UiTheme.LabelText, 12f, false, false);
+                RectTransform rlrt = rlbl.GetComponent<RectTransform>();
+                if (rlrt != null) { rlrt.anchorMin = Vector2.zero; rlrt.anchorMax = Vector2.one; rlrt.offsetMin = Vector2.zero; rlrt.offsetMax = Vector2.zero; }
+                TextMeshProUGUI? rlt = rlbl.GetComponent<TextMeshProUGUI>();
+                if (rlt != null) rlt.alignment = TextAlignmentOptions.Center;
+                UiListeners.OnClick(rbtn, () => StageReset(b));
+                rst.SetActive(false);
+                row.Reset = rst;
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] meta line '{b.Key}' failed: {ex.Message}"); }
+        }
+
+        // "default: X" plus the acceptable bounds (slider/ranged range, dropdown allowed set).
+        private static string MetaText(ConfigBinding b)
+        {
+            string def = b.Default != null ? Stringify(b.Default) : "-";
+            string s = "default: " + def;
+            try
+            {
+                if (b.Kind == ControlKind.Slider || ((b.Kind == ControlKind.IntInput || b.Kind == ControlKind.FloatInput) && b.HasRange))
+                    s += "      range " + TrimNum(b.Min) + "–" + TrimNum(b.Max);
+                else if ((b.Kind == ControlKind.EnumDropdown || b.Kind == ControlKind.ChoiceDropdown) && b.Choices != null && b.Choices.Length > 0)
+                    s += b.Choices.Length <= 6 ? "      options: " + string.Join(" / ", b.Choices) : "      " + b.Choices.Length + " options";
+            }
+            catch { }
+            return s;
+        }
+
+        private static string Stringify(object o)
+        {
+            try { return IsNumericValue(o) ? TrimNum(Convert.ToDouble(o)) : (o.ToString() ?? ""); }
+            catch { return o.ToString() ?? ""; }
+        }
+
+        private static string TrimNum(double d) => d.ToString("0.######");
+
+        private static void DisableInteractables(Transform block)
+        {
+            try
+            {
+                foreach (Selectable s in block.GetComponentsInChildren<Selectable>(true))
+                {
+                    if (s == null) continue;
+                    try { s.interactable = false; } catch { }
+                }
+            }
+            catch { }
+        }
+
+        private static void SetSnap(ConfigBinding b, Action snap)
+        {
+            if (_rows.TryGetValue(b, out RowUi? r)) r.Snap = snap;
         }
 
         private static void AddControl(ConfigBinding b)
@@ -423,12 +842,18 @@ namespace ModSettingsTool.UI
                 switch (b.Kind)
                 {
                     case ControlKind.Toggle:
-                        AddToggle(_refToggle!, _rightContent!, b.Key, b.Value is bool bv && bv, v => StageOrClear(b, v != AsBool(b.Value), () => { b.Value = v; }));
+                    {
+                        Toggle? tog = AddToggle(_refToggle!, _controlParent!, b.DisplayName, AsBool(EffectiveValue(b)), v => StageOrClear(b, v != AsBool(b.Value), v, () => { b.Value = v; }));
+                        if (tog != null) SetSnap(b, () => { try { tog.SetIsOnWithoutNotify(b.Default is bool db && db); } catch { } });
                         break;
+                    }
                     case ControlKind.Slider:
+                    {
                         bool whole = b.IsWholeNumber;
-                        AddSlider(_refSlider!, _rightContent!, b.Key, (float)b.Min, (float)b.Max, ToFloat(b.Value), whole, v => StageOrClear(b, !SliderEquals(v, ToFloat(b.Value), b), () => b.SetNumber(v)));
+                        (Slider? sl, Action<float>? set) = AddSlider(_refSlider!, _controlParent!, b.DisplayName, (float)b.Min, (float)b.Max, ToFloat(EffectiveValue(b)), whole, v => StageOrClear(b, !SliderEquals(v, ToFloat(b.Value), b), v, () => b.SetNumber(v)));
+                        if (sl != null && set != null) SetSnap(b, () => set(ToFloat(b.Default)));
                         break;
+                    }
                     case ControlKind.EnumDropdown:
                     case ControlKind.ChoiceDropdown:
                         AddDropdown(b);
@@ -438,8 +863,11 @@ namespace ModSettingsTool.UI
                         break;
                     case ControlKind.IntInput:
                     case ControlKind.FloatInput:
-                    case ControlKind.TextInput:
                         AddInputField(b);
+                        break;
+                    case ControlKind.TextInput:
+                        if (_refSlider != null && IsColorBinding(b)) AddColorEditor(b);
+                        else AddInputField(b);
                         break;
                     default: // Unsupported
                         AddReadOnly(b);
@@ -457,7 +885,7 @@ namespace ModSettingsTool.UI
             if (_refDropdown == null) { AddReadOnly(b); return; }
             try
             {
-                GameObject go = UnityEngine.Object.Instantiate(_refDropdown, _rightContent, false);
+                GameObject go = UnityEngine.Object.Instantiate(_refDropdown, _controlParent, false);
                 go.name = "MST " + b.Key;
                 TameRow(go, 54f);
 
@@ -467,7 +895,7 @@ namespace ModSettingsTool.UI
                 if (title != null)
                 {
                     UiBuild.DisableLoc(title);
-                    title.text = b.Key;
+                    title.text = b.DisplayName;
                     try { title.enableWordWrapping = false; title.overflowMode = TextOverflowModes.Overflow; } catch { }
                 }
 
@@ -476,7 +904,8 @@ namespace ModSettingsTool.UI
                     // CRITICAL: replace the cloned dropdown's PERSISTENT onValueChanged (a settings dropdown
                     // drives a real game setting, e.g. resolution) BEFORE touching its value, UiListeners
                     // swaps the whole event object and roots ours.
-                    UiListeners.OnChanged(dd, i => StageOrClear(b, i != b.CurrentChoiceIndex(), () => b.SetChoice(i)));
+                    UiListeners.OnChanged(dd, i => StageOrClear(b, i != b.CurrentChoiceIndex(), b.ChoiceValue(i), () => b.SetChoice(i)));
+                    SetSnap(b, () => { try { dd.SetValueWithoutNotify(b.DefaultChoiceIndex()); dd.RefreshShownValue(); } catch { } });
 
                     // Speed up the dropdown's own popup-list scrolling (the Template's ScrollRect).
                     try { ScrollRect tsr = dd.GetComponentInChildren<ScrollRect>(true); if (tsr != null) tsr.scrollSensitivity = 45f; } catch { }
@@ -485,7 +914,7 @@ namespace ModSettingsTool.UI
                     // we build, blanking our options ("Option 1") until the page is rebuilt, the deferred
                     // re-apply lands past that init.
                     ApplyDropdown(dd, b);
-                    _pendingDropdowns.Add(new PendingDropdown { Dd = dd, B = b, Until = Time.unscaledTime + 0.35f });
+                    _pendingDropdowns.Add(new PendingDropdown { Dd = dd, B = b });
                 }
             }
             catch (Exception ex)
@@ -504,10 +933,17 @@ namespace ModSettingsTool.UI
                 foreach (string c in b.Choices) opts.Add(c);
                 dd.ClearOptions();
                 dd.AddOptions(opts);
-                dd.SetValueWithoutNotify(b.CurrentChoiceIndex());
+                dd.SetValueWithoutNotify(EffectiveChoiceIndex(b)); // staged pick survives a search rebuild
                 dd.RefreshShownValue();
-                try { dd.Hide(); } catch { }                                              // ensure the popup is closed
-                try { if (dd.template != null) dd.template.gameObject.SetActive(false); } catch { } // hide the stuck template
+                // Only force the popup shut / hide the template when the dropdown is CLOSED. Doing this on an open
+                // dropdown would dismiss the popup the player just opened (the "won't open on first click" bug).
+                bool expanded = false;
+                try { expanded = dd.IsExpanded; } catch { }
+                if (!expanded)
+                {
+                    try { dd.Hide(); } catch { }                                              // ensure the popup is closed
+                    try { if (dd.template != null) dd.template.gameObject.SetActive(false); } catch { } // hide the stuck template
+                }
             }
             catch { }
         }
@@ -538,17 +974,16 @@ namespace ModSettingsTool.UI
         {
             try
             {
-                GameObject row = UiBuild.NewRect("MST Key " + b.Key, _rightContent!);
-                TameRow(row, 46f);
+                // A compact keycap + a Clear button, both FIXED width and right-aligned so they read as a small
+                // keyboard key rather than stretching across the wide pane (the smoke report). Row chrome + title
+                // are cloned from a real settings row so this matches the toggle / slider / dropdown rows.
+                const float capW = 92f, clearW = 60f, edge = 8f, gap = 8f;
+                GameObject row = CloneControlRow(b.DisplayName, edge + capW + gap + clearW, out _);
 
-                GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, row.transform, b.Key, new Color(0.9f, 0.9f, 0.9f, 1f), 16f, false, false);
-                RectTransform lrt = lblGo.GetComponent<RectTransform>();
-                if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(0.55f, 1f); lrt.offsetMin = new Vector2(6f, 0f); lrt.offsetMax = new Vector2(-4f, 0f); }
-
-                // A light "keycap": pale raised box, dark bold key text, a bevel-ish outline. Compact, right-aligned.
+                // A light "keycap": pale raised box, dark bold key text, a bevel-ish outline + top-left highlight.
                 GameObject cap = UiBuild.NewRect("KeyCap", row.transform);
                 RectTransform crt = cap.GetComponent<RectTransform>();
-                if (crt != null) { crt.anchorMin = new Vector2(0.70f, 0.13f); crt.anchorMax = new Vector2(1f, 0.87f); crt.offsetMin = new Vector2(4f, 0f); crt.offsetMax = new Vector2(-10f, 0f); }
+                if (crt != null) { crt.anchorMin = crt.anchorMax = new Vector2(1f, 0.5f); crt.pivot = new Vector2(1f, 0.5f); crt.sizeDelta = new Vector2(capW, 30f); crt.anchoredPosition = new Vector2(-edge, 0f); }
                 Image capBg = cap.AddComponent<Image>();
                 if (capBg != null) { capBg.color = new Color(0.88f, 0.89f, 0.92f, 1f); capBg.raycastTarget = true; }
                 Outline ol = cap.AddComponent<Outline>();
@@ -557,11 +992,14 @@ namespace ModSettingsTool.UI
                 if (sh != null) { sh.effectColor = new Color(1f, 1f, 1f, 0.5f); sh.effectDistance = new Vector2(-1f, 1f); } // top-left highlight
                 Button btn = cap.AddComponent<Button>();
 
-                GameObject capLbl = UiBuild.MakeLabel(_labelTemplate!, cap.transform, KeyName(b.Value), new Color(0.10f, 0.10f, 0.13f, 1f), 16f, false, false);
+                GameObject capLbl = UiBuild.MakeLabel(_labelTemplate!, cap.transform, KeyName(EffectiveValue(b)), new Color(0.10f, 0.10f, 0.13f, 1f), 16f, false, false);
                 RectTransform clrt = capLbl.GetComponent<RectTransform>();
-                if (clrt != null) { clrt.anchorMin = Vector2.zero; clrt.anchorMax = Vector2.one; clrt.offsetMin = new Vector2(8f, 0f); clrt.offsetMax = new Vector2(-8f, 0f); }
+                if (clrt != null) { clrt.anchorMin = Vector2.zero; clrt.anchorMax = Vector2.one; clrt.offsetMin = new Vector2(6f, 0f); clrt.offsetMax = new Vector2(-6f, 0f); }
                 TextMeshProUGUI? capTmp = capLbl.GetComponent<TextMeshProUGUI>();
-                if (capTmp != null) { capTmp.alignment = TextAlignmentOptions.Center; try { capTmp.fontStyle = FontStyles.Bold; } catch { } }
+                // Auto-size so a long key name ("LeftControl", "PageDown") shrinks to fit the fixed-width cap.
+                if (capTmp != null) { capTmp.alignment = TextAlignmentOptions.Center; try { capTmp.fontStyle = FontStyles.Bold; capTmp.enableAutoSizing = true; capTmp.fontSizeMin = 9f; capTmp.fontSizeMax = 16f; } catch { } }
+
+                SetSnap(b, () => { try { if (capTmp != null) capTmp.text = KeyName(b.Default); } catch { } });
 
                 UiListeners.OnClick(btn, () =>
                 {
@@ -573,11 +1011,11 @@ namespace ModSettingsTool.UI
                     if (capTmp != null) capTmp.text = "Press a key…";
                 });
 
-                // A small "Clear" button so KeyCode.None (the disabled/unbound value many mods use) is reachable:
+                // A small "Clear" button so KeyCode.None (the disabled/unbound value many mods use) is reachable,
                 // capture alone can never produce None, since there is no key to press for it.
                 GameObject clr = UiBuild.NewRect("KeyClear", row.transform);
                 RectTransform xrt = clr.GetComponent<RectTransform>();
-                if (xrt != null) { xrt.anchorMin = new Vector2(0.55f, 0.16f); xrt.anchorMax = new Vector2(0.69f, 0.84f); xrt.offsetMin = new Vector2(2f, 0f); xrt.offsetMax = new Vector2(-2f, 0f); }
+                if (xrt != null) { xrt.anchorMin = xrt.anchorMax = new Vector2(1f, 0.5f); xrt.pivot = new Vector2(1f, 0.5f); xrt.sizeDelta = new Vector2(clearW, 26f); xrt.anchoredPosition = new Vector2(-(edge + capW + gap), 0f); }
                 Image xbg = clr.AddComponent<Image>();
                 if (xbg != null) { xbg.color = new Color(1f, 1f, 1f, 0.10f); xbg.raycastTarget = true; }
                 Button xbtn = clr.AddComponent<Button>();
@@ -589,7 +1027,7 @@ namespace ModSettingsTool.UI
                 UiListeners.OnClick(xbtn, () =>
                 {
                     if (_capturing != null) EndCapture(); // cancel/restore any active capture, this row OR another
-                    StageOrClear(b, KeyCode.None.ToString() != (b.Value?.ToString() ?? ""), () => b.SetKey(KeyCode.None));
+                    StageOrClear(b, KeyCode.None.ToString() != (b.Value?.ToString() ?? ""), KeyCode.None, () => b.SetKey(KeyCode.None));
                     try { if (capTmp != null) capTmp.text = KeyCode.None.ToString(); } catch { }
                 });
             }
@@ -603,7 +1041,7 @@ namespace ModSettingsTool.UI
         private static void AddReadOnly(ConfigBinding b)
         {
             string val = b.Value?.ToString() ?? "";
-            UiBuild.MakeLabel(_labelTemplate!, _rightContent!, $"{b.Key}: {val}  (read-only)", new Color(0.78f, 0.78f, 0.78f, 1f), 15f, true, false);
+            UiBuild.MakeLabel(_labelTemplate!, _controlParent!, $"{b.DisplayName}: {val}  (read-only)", UiTheme.FaintText, 15f, true, false);
         }
 
         // IntInput / FloatInput / TextInput: a left label + a right TMP_InputField. CLONE a real loaded field
@@ -634,19 +1072,16 @@ namespace ModSettingsTool.UI
             try
             {
                 bool isText = b.Kind == ControlKind.TextInput;
+                float inputW = isText ? 300f : 170f;        // a fixed-width well, right-aligned (not a % of the wide pane)
+                float swatchRoom = isText ? 32f : 0f;       // space reserved at the row's right edge for the colour swatch
 
-                GameObject row = UiBuild.NewRect("MST " + b.Key, _rightContent!);
-                TameRow(row, 46f);
-
-                GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, row.transform, b.Key, new Color(0.9f, 0.9f, 0.9f, 1f), 16f, false, false);
-                RectTransform lrt = lblGo.GetComponent<RectTransform>();
-                if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(0.48f, 1f); lrt.offsetMin = new Vector2(6f, 0f); lrt.offsetMax = new Vector2(-4f, 0f); }
+                GameObject row = CloneControlRow(b.DisplayName, inputW + swatchRoom, out _); // game row chrome + title
 
                 GameObject inGo = UnityEngine.Object.Instantiate(_refInput!, row.transform, false);
                 inGo.name = "Input";
                 inGo.SetActive(true);
                 RectTransform irt = inGo.GetComponent<RectTransform>();
-                if (irt != null) { irt.anchorMin = new Vector2(0.48f, 0.12f); irt.anchorMax = new Vector2(1f, 0.88f); irt.offsetMin = new Vector2(4f, 0f); irt.offsetMax = new Vector2(isText ? -34f : -4f, 0f); irt.localScale = Vector3.one; }
+                if (irt != null) { irt.anchorMin = irt.anchorMax = new Vector2(1f, 0.5f); irt.pivot = new Vector2(1f, 0.5f); irt.sizeDelta = new Vector2(inputW, 30f); irt.anchoredPosition = new Vector2(-(swatchRoom + 4f), 0f); irt.localScale = Vector3.one; }
 
                 TMP_InputField? input = inGo.GetComponent<TMP_InputField>();
                 if (input == null) { UnityEngine.Object.Destroy(inGo); AddScratchInput(b); return; }
@@ -660,13 +1095,14 @@ namespace ModSettingsTool.UI
                 input.lineType = TMP_InputField.LineType.SingleLine;
                 input.readOnly = false;
                 input.interactable = true;
-                input.SetTextWithoutNotify(b.Value?.ToString() ?? "");
+                input.SetTextWithoutNotify(EffectiveValue(b)?.ToString() ?? ""); // staged text survives a search rebuild
 
                 Image? swatch = isText ? MakeSwatch(row.transform) : null;
                 if (swatch != null) UpdateSwatch(swatch, input.text);
 
                 WireInputEndEdit(b, input);
                 if (swatch != null) { Image sw = swatch; UiListeners.OnValueChanged(input, s => UpdateSwatch(sw, s)); }
+                SetSnap(b, () => { try { input.SetTextWithoutNotify(b.Default?.ToString() ?? ""); if (swatch != null) UpdateSwatch(swatch, input.text); } catch { } });
             }
             catch (Exception ex)
             {
@@ -733,11 +1169,37 @@ namespace ModSettingsTool.UI
                     try { s.interactable = false; s.enabled = false; } catch { }
                 }
 
+                // Disable any FOREIGN behaviour the clone source carried. The clone source is just "some loaded
+                // TMP_InputField" (Resources.FindObjectsOfTypeAll), on the main menu that is often the money-HUD
+                // field, whose updater script keeps running on our clone and rewrites it every frame with the
+                // game's "$0.<size=...>00" string (shown literally since we set richText=false) AND thrashes
+                // layout (which destabilises the right-pane scroll). Keep ONLY the input field, its text/bg
+                // graphics, and the essential masking/scroll bits; switch every other component off. Foreign
+                // game types resolve to a base wrapper, but Behaviour.enabled works regardless of the real type.
+                foreach (Behaviour comp in inGo.GetComponentsInChildren<Behaviour>(true))
+                {
+                    if (comp == null) continue;
+                    try
+                    {
+                        if (comp.TryCast<TMP_InputField>() != null) continue; // the field itself
+                        if (comp.TryCast<Graphic>() != null) continue;        // Image bg + TMP text/placeholder
+                        if (comp.TryCast<RectMask2D>() != null) continue;
+                        if (comp.TryCast<Mask>() != null) continue;
+                        if (comp.TryCast<ScrollRect>() != null) continue;     // a long-text field's own viewport scroll
+                        comp.enabled = false;
+                    }
+                    catch { }
+                }
+
                 if (txt != null)
                 {
                     txt.enableAutoSizing = false;
                     txt.fontSize = 18f;
                     txt.richText = false; // show colour codes etc. literally, never parse the value as TMP markup
+                    txt.color = UiTheme.InputText; // dark text on the pale well (readable)
+                    // Vertical mode MUST be Middle (Left), not Midline: the Midline metric sits low so the caret's
+                    // top clips off (the half-caret); Left = horizontal-Left + vertical-Middle gives a full caret.
+                    txt.alignment = TextAlignmentOptions.Left;
                     // Strip any negative/mirror scale baked into the source transforms on the kept text's chain.
                     Transform tr = txt.transform;
                     int rootId = inGo.transform.GetInstanceID();
@@ -748,6 +1210,10 @@ namespace ModSettingsTool.UI
                         tr = tr.parent;
                     }
                 }
+
+                // Dark caret on the pale well + a delineating outline, matching the scratch/search fields.
+                try { input.customCaretColor = true; input.caretColor = UiTheme.InputText; input.selectionColor = new Color(0.30f, 0.55f, 1f, 0.45f); } catch { }
+                try { Outline ol = inGo.GetComponent<Outline>(); if (ol == null) ol = inGo.AddComponent<Outline>(); if (ol != null) { ol.effectColor = UiTheme.InputOutline; ol.effectDistance = new Vector2(1f, -1f); } } catch { }
             }
             catch (Exception ex)
             {
@@ -761,7 +1227,7 @@ namespace ModSettingsTool.UI
             img.overrideSprite = null;
             img.sprite = null;
             img.type = Image.Type.Simple;
-            img.color = new Color(1f, 1f, 1f, 0.12f);
+            img.color = UiTheme.InputBg; // pale field (readable dark text), matching the search/scratch wells
             img.raycastTarget = true;
         }
 
@@ -771,39 +1237,26 @@ namespace ModSettingsTool.UI
             try
             {
                 bool isText = b.Kind == ControlKind.TextInput;
+                float inputW = isText ? 300f : 170f;        // a fixed-width well, right-aligned (not a % of the wide pane)
+                float swatchRoom = isText ? 32f : 0f;       // space reserved at the row's right edge for the colour swatch
 
-                GameObject row = UiBuild.NewRect("MST " + b.Key, _rightContent!);
-                TameRow(row, 46f);
-
-                GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, row.transform, b.Key, new Color(0.9f, 0.9f, 0.9f, 1f), 16f, false, false);
-                RectTransform lrt = lblGo.GetComponent<RectTransform>();
-                if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(0.48f, 1f); lrt.offsetMin = new Vector2(6f, 0f); lrt.offsetMax = new Vector2(-4f, 0f); }
+                GameObject row = CloneControlRow(b.DisplayName, inputW + swatchRoom, out _); // game row chrome + title
 
                 GameObject inGo = UiBuild.NewRect("Input", row.transform);
                 RectTransform irt = inGo.GetComponent<RectTransform>();
-                if (irt != null) { irt.anchorMin = new Vector2(0.48f, 0.12f); irt.anchorMax = new Vector2(1f, 0.88f); irt.offsetMin = new Vector2(4f, 0f); irt.offsetMax = new Vector2(isText ? -34f : -4f, 0f); }
+                if (irt != null) { irt.anchorMin = irt.anchorMax = new Vector2(1f, 0.5f); irt.pivot = new Vector2(1f, 0.5f); irt.sizeDelta = new Vector2(inputW, 30f); irt.anchoredPosition = new Vector2(-(swatchRoom + 4f), 0f); }
                 Image inBg = inGo.AddComponent<Image>();
-                if (inBg != null) { inBg.color = new Color(1f, 1f, 1f, 0.12f); inBg.raycastTarget = true; }
+                if (inBg != null) { inBg.color = UiTheme.InputBg; inBg.raycastTarget = true; }
+                Outline obg = inGo.AddComponent<Outline>();
+                if (obg != null) { obg.effectColor = UiTheme.InputOutline; obg.effectDistance = new Vector2(1f, -1f); }
 
                 GameObject area = UiBuild.NewRect("Text Area", inGo.transform);
                 RectTransform art = area.GetComponent<RectTransform>();
                 if (art != null) { art.anchorMin = new Vector2(0f, 0f); art.anchorMax = new Vector2(1f, 1f); art.offsetMin = new Vector2(6f, 2f); art.offsetMax = new Vector2(-6f, -2f); }
                 area.AddComponent<RectMask2D>();
 
-                GameObject txtGo = UiBuild.MakeLabel(_labelTemplate!, area.transform, b.Value?.ToString() ?? "", new Color(1f, 1f, 1f, 1f), 15f, false, false);
-                RectTransform trt = txtGo.GetComponent<RectTransform>();
-                if (trt != null) { trt.anchorMin = new Vector2(0f, 0f); trt.anchorMax = new Vector2(1f, 1f); trt.offsetMin = Vector2.zero; trt.offsetMax = Vector2.zero; }
-                TextMeshProUGUI? txt = txtGo.GetComponent<TextMeshProUGUI>();
-
-                Image? swatch = null;
-                if (isText)
-                {
-                    GameObject swGo = UiBuild.NewRect("Swatch", row.transform);
-                    RectTransform srt = swGo.GetComponent<RectTransform>();
-                    if (srt != null) { srt.anchorMin = new Vector2(1f, 0.5f); srt.anchorMax = new Vector2(1f, 0.5f); srt.pivot = new Vector2(1f, 0.5f); srt.sizeDelta = new Vector2(26f, 26f); srt.anchoredPosition = new Vector2(-4f, 0f); }
-                    swatch = swGo.AddComponent<Image>();
-                    if (swatch != null) swatch.raycastTarget = false;
-                }
+                TextMeshProUGUI? txt = ConfigInputText(area.transform);
+                Image? swatch = isText ? MakeSwatch(row.transform) : null;
 
                 TMP_InputField input = inGo.AddComponent<TMP_InputField>();
                 if (input != null && txt != null)
@@ -814,12 +1267,8 @@ namespace ModSettingsTool.UI
                                       : b.Kind == ControlKind.FloatInput ? TMP_InputField.ContentType.DecimalNumber
                                       : TMP_InputField.ContentType.Standard;
                     input.lineType = TMP_InputField.LineType.SingleLine;
-                    input.caretWidth = 3;
-                    input.customCaretColor = true;
-                    input.caretColor = new Color(1f, 1f, 1f, 1f);
-                    input.selectionColor = new Color(0.30f, 0.55f, 1f, 0.55f);
-                    input.caretBlinkRate = 0f; // solid (always visible) caret
-                    input.text = b.Value?.ToString() ?? "";
+                    ConfigInputCaret(input);
+                    input.text = EffectiveValue(b)?.ToString() ?? ""; // staged text survives a search rebuild
 
                     WireInputEndEdit(b, input);
                     if (swatch != null)
@@ -828,6 +1277,9 @@ namespace ModSettingsTool.UI
                         UpdateSwatch(sw, input.text);
                         UiListeners.OnValueChanged(input, s => UpdateSwatch(sw, s));
                     }
+                    TMP_InputField inputRef = input;
+                    Image? swatchRef = swatch;
+                    SetSnap(b, () => { try { inputRef.SetTextWithoutNotify(b.Default?.ToString() ?? ""); if (swatchRef != null) UpdateSwatch(swatchRef, inputRef.text); } catch { } });
                 }
             }
             catch (Exception ex)
@@ -854,16 +1306,17 @@ namespace ModSettingsTool.UI
                     // / out-of-range value) as saved.
                     object? parsed = b.ParseTyped(s);
                     if (parsed != null && b.InRange(parsed))
-                        StageOrClear(b, !Equals(parsed, b.Value), () => { b.Value = parsed; });
+                        StageOrClear(b, !Equals(parsed, b.Value), parsed, () => { b.Value = parsed; });
                     else
                     {
                         _staged.Remove(b);
+                        UpdateMarker(b);
                         try { input.SetTextWithoutNotify(b.Value?.ToString() ?? ""); } catch { }
                     }
                 }
                 else
                 {
-                    StageOrClear(b, !string.Equals(s, b.Value?.ToString() ?? "", StringComparison.Ordinal), () => CommitInput(b, s));
+                    StageOrClear(b, !string.Equals(s, b.Value?.ToString() ?? "", StringComparison.Ordinal), s, () => CommitInput(b, s));
                 }
             });
         }
@@ -915,7 +1368,9 @@ namespace ModSettingsTool.UI
                 if (TryComp(parts[0], out float r) && TryComp(parts[1], out float g) && TryComp(parts[2], out float bl))
                 {
                     float a = 1f;
-                    if (parts.Length == 4) TryComp(parts[3], out a);
+                    // A 4th component that is present but unparseable must REJECT the whole value, not silently
+                    // become 0 (transparent), otherwise "rgba(255,0,0,bad)" stages a different colour than typed.
+                    if (parts.Length == 4 && !TryComp(parts[3], out a)) return false;
                     c = new Color(r, g, bl, a);
                     return true;
                 }
@@ -931,6 +1386,187 @@ namespace ModSettingsTool.UI
             return true;
         }
 
+        // ── colour editor (option A: RGBA sliders + hex + live swatch) ─────────────────────────────────
+
+        // A colour-valued string gets a richer editor than a plain text box: a large live swatch, a hex field,
+        // and R/G/B/A sliders (0–255). Editing any path updates the others WITHOUT notifying (no feedback loop)
+        // and stages the canonical hex string through the live ConfigEntry. Non-colour strings never reach here.
+        private static void AddColorEditor(ConfigBinding b)
+        {
+            Transform parent = _controlParent!; // captured outside the try so the catch can restore _controlParent
+            try
+            {
+                // Seed from the EFFECTIVE value (staged if staged, else live) so a search rebuild repaints a
+                // staged colour, falling back to the default then white.
+                if (!TryParseColor(EffectiveValue(b)?.ToString() ?? "", out Color c0) &&
+                    !TryParseColor(b.Default?.ToString() ?? "", out c0))
+                    c0 = Color.white;
+
+                // Header = the colour row: name (left, cloned game-row chrome) + a centred "click to edit" hint + a
+                // live swatch (right). The whole row is a button that expands/collapses the editor body below; the
+                // body (R/G/B/A sliders + hex) is COLLAPSED BY DEFAULT so the colour rows stay compact until edited.
+                GameObject head = CloneControlRow(b.DisplayName, 84f, out _);
+                Image? headImg = head.GetComponent<Image>();
+                if (headImg != null) headImg.raycastTarget = true; // the row bg is the click surface
+                Button headBtn = head.AddComponent<Button>();
+
+                GameObject swGo = UiBuild.NewRect("Swatch", head.transform);
+                RectTransform srt = swGo.GetComponent<RectTransform>();
+                if (srt != null) { srt.anchorMin = new Vector2(1f, 0.5f); srt.anchorMax = new Vector2(1f, 0.5f); srt.pivot = new Vector2(1f, 0.5f); srt.sizeDelta = new Vector2(72f, 28f); srt.anchoredPosition = new Vector2(-6f, 0f); }
+                Image? swatch = swGo.AddComponent<Image>();
+                if (swatch != null) { swatch.raycastTarget = false; swatch.color = c0; }
+                Outline so = swGo.AddComponent<Outline>();
+                if (so != null) { so.effectColor = new Color(0f, 0f, 0f, 0.55f); so.effectDistance = new Vector2(1f, -1f); }
+
+                GameObject hintGo = UiBuild.MakeLabel(_labelTemplate!, head.transform, "( click to edit )", new Color(0.16f, 0.16f, 0.22f, 0.92f), 14f, false, false);
+                RectTransform hrt = hintGo.GetComponent<RectTransform>();
+                if (hrt != null) { hrt.anchorMin = new Vector2(0f, 0f); hrt.anchorMax = new Vector2(1f, 1f); hrt.offsetMin = new Vector2(0f, 0f); hrt.offsetMax = new Vector2(-90f, 0f); } // centred, clear of the swatch
+                TextMeshProUGUI? hintTmp = hintGo.GetComponent<TextMeshProUGUI>();
+                if (hintTmp != null) { hintTmp.alignment = TextAlignmentOptions.Center; try { hintTmp.fontStyle = FontStyles.Italic; } catch { } }
+
+                // The collapsible editor body (collapsed by default), holding the hex field + R/G/B/A sliders.
+                Transform container = UiBuild.MakeCard(parent, UiTheme.CardBg);
+                container.gameObject.SetActive(false);
+
+                // Sync plumbing, assigned after the controls exist; the wiring lambdas capture these vars and
+                // call the latest assignment. `updating` guards the (already no-notify) cross-updates.
+                bool updating = false;
+                Action push = () => { };
+                Action<string> pull = _ => { };
+
+                // Route the hex row (CloneControlRow uses _controlParent) + sliders into the collapsible body.
+                _controlParent = container;
+                TMP_InputField? hex = MakeHexField(container, b, Canon(c0), s => pull(s));
+                (Slider? slR, Action<float>? setR) = AddSlider(_refSlider!, container, "R", 0f, 255f, c0.r * 255f, true, _ => push());
+                (Slider? slG, Action<float>? setG) = AddSlider(_refSlider!, container, "G", 0f, 255f, c0.g * 255f, true, _ => push());
+                (Slider? slB, Action<float>? setB) = AddSlider(_refSlider!, container, "B", 0f, 255f, c0.b * 255f, true, _ => push());
+                (Slider? slA, Action<float>? setA) = AddSlider(_refSlider!, container, "A", 0f, 255f, c0.a * 255f, true, _ => push());
+                _controlParent = parent;
+
+                UiListeners.OnClick(headBtn, () =>
+                {
+                    bool show = !container.gameObject.activeSelf;
+                    container.gameObject.SetActive(show);
+                    if (hintTmp != null) hintTmp.text = show ? "( click to collapse )" : "( click to edit )";
+                    UiBuild.RefreshScrollHint(_rightContent);
+                });
+
+                push = () =>
+                {
+                    if (updating || slR == null || slG == null || slB == null) return;
+                    updating = true;
+                    try
+                    {
+                        float a = slA != null ? slA.value : 255f;
+                        Color c = new Color(slR.value / 255f, slG.value / 255f, slB.value / 255f, a / 255f);
+                        if (swatch != null) swatch.color = c;
+                        string canon = Canon(c);
+                        if (hex != null) hex.SetTextWithoutNotify(canon);
+                        StageColor(b, canon);
+                    }
+                    finally { updating = false; }
+                };
+
+                pull = s =>
+                {
+                    if (updating || !TryParseColor(s, out Color c)) return;
+                    updating = true;
+                    try
+                    {
+                        setR?.Invoke(c.r * 255f); setG?.Invoke(c.g * 255f); setB?.Invoke(c.b * 255f); setA?.Invoke(c.a * 255f);
+                        if (swatch != null) swatch.color = c;
+                        StageColor(b, Canon(c));
+                    }
+                    finally { updating = false; }
+                };
+
+                SetSnap(b, () =>
+                {
+                    if (!TryParseColor(b.Default?.ToString() ?? "", out Color d)) return;
+                    updating = true;
+                    try
+                    {
+                        setR?.Invoke(d.r * 255f); setG?.Invoke(d.g * 255f); setB?.Invoke(d.b * 255f); setA?.Invoke(d.a * 255f);
+                        if (swatch != null) swatch.color = d;
+                        if (hex != null) hex.SetTextWithoutNotify(Canon(d));
+                    }
+                    finally { updating = false; }
+                });
+            }
+            catch (Exception ex)
+            {
+                _controlParent = parent; // a mid-build throw may have left it pointed at the (collapsed) container
+                Plugin.Logger.LogWarning($"[ModsTab] colour editor '{b.Key}' failed: {ex.GetType().Name}: {ex.Message}");
+                AddInputField(b); // degrade to the plain text field + swatch
+            }
+        }
+
+        // A cloned single-line hex input ("#RRGGBB[AA]") for the colour editor. Returns null if no field template
+        // exists (the caller keeps the sliders). Reuses NormalizeClonedInput to flatten the arbitrary clone.
+        private static TMP_InputField? MakeHexField(Transform parent, ConfigBinding b, string initial, Action<string> onEdit)
+        {
+            if (_refInput == null) return null;
+            try
+            {
+                const float hexW = 200f;
+                GameObject row = CloneControlRow("Hex", hexW, out _); // game row chrome + title, matching the other rows
+
+                GameObject inGo = UnityEngine.Object.Instantiate(_refInput, row.transform, false);
+                inGo.name = "Hex Input";
+                inGo.SetActive(true);
+                RectTransform irt = inGo.GetComponent<RectTransform>();
+                if (irt != null) { irt.anchorMin = irt.anchorMax = new Vector2(1f, 0.5f); irt.pivot = new Vector2(1f, 0.5f); irt.sizeDelta = new Vector2(hexW, 30f); irt.anchoredPosition = new Vector2(-4f, 0f); irt.localScale = Vector3.one; }
+
+                TMP_InputField? input = inGo.GetComponent<TMP_InputField>();
+                if (input == null) { UnityEngine.Object.Destroy(inGo); return null; }
+
+                foreach (TextMeshProUGUI t in inGo.GetComponentsInChildren<TextMeshProUGUI>(true)) UiBuild.DisableLoc(t);
+                NormalizeClonedInput(inGo, input);
+                input.contentType = TMP_InputField.ContentType.Standard;
+                input.lineType = TMP_InputField.LineType.SingleLine;
+                input.characterLimit = 9; // "#RRGGBBAA"
+                input.readOnly = false;
+                input.interactable = true;
+                input.SetTextWithoutNotify(initial);
+
+                UiListeners.OnValueChanged(input, onEdit); // live as they type
+                UiListeners.OnEndEdit(input, onEdit);       // and on commit
+                return input;
+            }
+            catch { return null; }
+        }
+
+        private static void StageColor(ConfigBinding b, string canon)
+            => StageOrClear(b, !ValuesEqual(canon, b.Value), canon, () => b.Value = canon);
+
+        // The canonical colour string written back: "#RRGGBB" (opaque) or "#RRGGBBAA".
+        private static string Canon(Color c)
+            => c.a >= 0.999f ? "#" + ColorUtility.ToHtmlStringRGB(c) : "#" + ColorUtility.ToHtmlStringRGBA(c);
+
+        private static bool IsColorBinding(ConfigBinding b)
+            => IsColorLike(b.Value?.ToString() ?? "") || IsColorLike(b.Default?.ToString() ?? "");
+
+        // Stricter than TryParseColor: only treat a string as a colour when it LOOKS like one (#hex, rgb(...), a
+        // comma list, or a bare 6/8-hex), so a plain word that happens to be an HTML colour name (e.g. "red") or
+        // an arbitrary string isn't hijacked into the colour editor.
+        private static bool IsColorLike(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            s = s.Trim();
+            if (s.StartsWith("#")) return TryParseColor(s, out _);
+            if (s.StartsWith("rgb", StringComparison.OrdinalIgnoreCase)) return TryParseColor(s, out _);
+            if (s.IndexOf(',') >= 0) return TryParseColor(s, out _);
+            if ((s.Length == 6 || s.Length == 8) && IsHex(s)) return TryParseColor("#" + s, out _);
+            return false;
+        }
+
+        private static bool IsHex(string s)
+        {
+            foreach (char ch in s)
+                if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) return false;
+            return true;
+        }
+
         private static void ShowRightMessage(string msg)
         {
             if (_rightContent == null || _labelTemplate == null) return;
@@ -939,16 +1575,387 @@ namespace ModSettingsTool.UI
             UiBuild.ResetScrollAndRefreshHint(_rightContent); // top + single-line message never overflows, so clears any stale hint
         }
 
-        // ── staged save / discard ─────────────────────────────────────────────────────────────────────
+        // Custom mouse-wheel scrolling for our two panes (the ScrollRect's built-in wheel is disabled). Moves a
+        // fixed FRACTION of the viewport per notch, so it feels the same on a short or a long page and a single
+        // notch can never jump to the bottom (the fixed-pixel built-in did, on short pages). Scrolls the pane the
+        // cursor is over; if hover can't be resolved, defaults to the right (config) pane.
+        private static void WheelScroll()
+        {
+            // Only when our Mods tab is the visible tab, otherwise we'd react to wheel input on other settings
+            // tabs or while the window is closed (and drive a hidden pane).
+            try { if (_builtPanel == null || !_builtPanel.activeInHierarchy) return; } catch { return; }
+            float wheel;
+            try { wheel = Input.mouseScrollDelta.y; } catch { return; }
+            if (wheel > -0.01f && wheel < 0.01f) return;
+            // While a dropdown popup is open, let ITS option list consume the wheel, don't also scroll the
+            // config pane underneath (the same notch would move both).
+            if (AnyDropdownExpanded()) return;
+            if (TryScrollPane(_rightContent, wheel, true)) return;
+            if (TryScrollPane(_leftContent, wheel, true)) return;
+            TryScrollPane(_rightContent, wheel, false); // hover unresolved (e.g. cursor over the search strip), scroll the config pane
+        }
 
-        private static void Stage(ConfigBinding b, Action apply) => _staged[b] = apply;
+        // True while any of the current page's dropdowns has its popup open.
+        private static bool AnyDropdownExpanded()
+        {
+            for (int i = 0; i < _pendingDropdowns.Count; i++)
+            {
+                TMP_Dropdown dd = _pendingDropdowns[i].Dd;
+                try { if (dd != null && dd.IsExpanded) return true; } catch { }
+            }
+            return false;
+        }
+
+        private static bool TryScrollPane(Transform? content, float wheel, bool requireHover)
+        {
+            try
+            {
+                if (content == null) return false;
+                ScrollRect sr = content.GetComponentInParent<ScrollRect>();
+                if (sr == null || sr.viewport == null || sr.content == null) return false;
+                if (requireHover && !MouseOverRect(sr.viewport)) return false;
+                float vh = sr.viewport.rect.height;
+                float range = sr.content.rect.height - vh;
+                if (range <= 1f) return true; // mouse is over this pane but there's nothing to scroll
+                float stepPx = Mathf.Min(vh * 0.6f, vh * 0.22f * Mathf.Abs(wheel)); // ~a fifth of a screenful per notch, capped at 0.6
+                float dn = (stepPx / range) * (wheel > 0f ? 1f : -1f);            // wheel up (+) -> toward the top (normalized 1)
+                sr.verticalNormalizedPosition = Mathf.Clamp01(sr.verticalNormalizedPosition + dn);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // True when the cursor is inside this RectTransform. Uses world corners, which for a screen-space-overlay
+        // canvas (the settings window) are already screen pixels, so it compares directly against the mouse.
+        private static bool MouseOverRect(RectTransform rt)
+        {
+            try
+            {
+                var c = new Il2CppStructArray<Vector3>(4); // [BL, TL, TR, BR]
+                rt.GetWorldCorners(c);
+                Vector3 m = Input.mousePosition;
+                return m.x >= c[0].x && m.x <= c[2].x && m.y >= c[0].y && m.y <= c[2].y;
+            }
+            catch { return false; }
+        }
+
+        // ── Tier 3: per-mod search + density ────────────────────────────────────────────────────────────
+
+        // Whether to render the per-setting description sub-text ([UI] ShowDescriptions; default on, fail-soft).
+        private static bool ShowDescriptionsEnabled()
+        {
+            try { return Plugin.Settings.ShowDescriptions.Value; } catch { return true; }
+        }
+
+        // Shared crisp-text setup for a scratch input field's text component: an opaque white label that fills the
+        // text area, a small left margin so the caret at position 0 is not half-clipped by the area's mask, and
+        // richText off so a value is never parsed as TMP markup. Returns the TextMeshProUGUI (null on failure).
+        private static TextMeshProUGUI? ConfigInputText(Transform area)
+        {
+            GameObject txtGo = UiBuild.MakeLabel(_labelTemplate!, area, "", new Color(1f, 1f, 1f, 1f), 16f, false, false);
+            RectTransform trt = txtGo.GetComponent<RectTransform>();
+            if (trt != null) { trt.anchorMin = Vector2.zero; trt.anchorMax = Vector2.one; trt.offsetMin = Vector2.zero; trt.offsetMax = Vector2.zero; trt.pivot = new Vector2(0.5f, 0.5f); }
+            TextMeshProUGUI? txt = txtGo.GetComponent<TextMeshProUGUI>();
+            if (txt != null)
+            {
+                txt.enableAutoSizing = false;
+                txt.fontSize = 16f;
+                txt.richText = false;
+                txt.color = UiTheme.InputText; // dark text on the pale well (readable; the dark well washed it out before)
+                try { txt.enableVertexGradient = false; txt.alpha = 1f; } catch { }
+                // Vertical mode MUST be Middle (geometric centre), not Midline: TMP derives the caret height from the
+                // line's vertical metric, and the Midline metric sits low so the glyph box rides up and the caret's
+                // top clips off, the "half caret". TextAlignmentOptions.Left = horizontal-Left + vertical-Middle.
+                txt.alignment = TextAlignmentOptions.Left;
+                try { txt.margin = new Vector4(3f, 0f, 3f, 0f); } catch { } // keep the caret off the mask edge
+                try { txt.ForceMeshUpdate(); } catch { } // refresh metrics so the caret takes our font size's full height
+            }
+            return txt;
+        }
+
+        // Shared caret/selection setup: a solid (non-blinking) white caret, blue selection, and NO select-all on
+        // focus, so re-focusing after a deferred search rebuild leaves the caret where we placed it (at the end)
+        // instead of highlighting everything (which the next keystroke would replace).
+        private static void ConfigInputCaret(TMP_InputField input)
+        {
+            input.caretWidth = 3;
+            input.customCaretColor = true;
+            input.caretColor = UiTheme.InputText; // dark caret on the pale well
+            input.selectionColor = new Color(0.30f, 0.55f, 1f, 0.45f);
+            input.caretBlinkRate = 0f; // solid (always visible) caret
+            try { input.onFocusSelectAll = false; } catch { }
+        }
+
+        // Anchor a setting label to fill its row from the left, stopping a fixed distance from the right edge so a
+        // FIXED-width control (input box / keycap) sits to its right without scaling with the pane width (the smoke
+        // report: text/keybind controls were "far too wide" because they used percentage anchors of a wide pane).
+        private static void LayoutInputLabel(GameObject lblGo, float rightReserve)
+        {
+            RectTransform lrt = lblGo.GetComponent<RectTransform>();
+            if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(1f, 1f); lrt.offsetMin = new Vector2(6f, 0f); lrt.offsetMax = new Vector2(-(rightReserve + 14f), 0f); }
+        }
+
+        // Clone a real settings row (the toggle template) so our CUSTOM controls (keybind, text/number input,
+        // colour editor) reuse the GAME's row chrome, the blue panel + bold dark title, and read IDENTICALLY to
+        // the cloned toggle/slider/dropdown rows (the smoke report: keybind + input rows were formatted differently
+        // from the others). The cloned toggle's checkbox is neutralized + hidden (MST-RULE-12: replace its event
+        // first) leaving the right side free for the caller's control; the title is set, kept in the game's style,
+        // and re-anchored to reserve `rightReserve` px on the right. Falls back to a plain scratch row if there is
+        // no toggle template (then the title uses our light theme colour, legible on the fallback's neutral bg).
+        private static GameObject CloneControlRow(string title, float rightReserve, out TextMeshProUGUI? titleTmp)
+        {
+            titleTmp = null;
+            if (_refToggle != null)
+            {
+                try
+                {
+                    GameObject go = UnityEngine.Object.Instantiate(_refToggle, _controlParent!, false);
+                    go.name = "MST Row " + title;
+                    TameRow(go, 46f);
+
+                    TextMeshProUGUI? t = go.GetComponentInChildren<TextMeshProUGUI>(true);
+                    if (t != null)
+                    {
+                        UiBuild.DisableLoc(t);
+                        t.text = title;
+                        try { t.enableWordWrapping = false; t.overflowMode = TextOverflowModes.Overflow; } catch { }
+                        LayoutInputLabel(t.gameObject, rightReserve); // keep the game's font/colour; just reserve the control's space
+                        titleTmp = t;
+                    }
+
+                    // Hide + neutralize the cloned toggle's checkbox so only the row chrome + title remain. NEVER
+                    // disable a graphic that IS the row root (that would erase the blue panel we are cloning FOR).
+                    foreach (Toggle tog in go.GetComponentsInChildren<Toggle>(true))
+                    {
+                        if (tog == null) continue;
+                        try { tog.onValueChanged = new Toggle.ToggleEvent(); } catch { } // MST-RULE-12: drop the serialized game action
+                        try { tog.interactable = false; tog.enabled = false; } catch { }
+                        try { if (tog.graphic != null) tog.graphic.enabled = false; } catch { }                                    // checkmark
+                        try { if (tog.targetGraphic != null && tog.targetGraphic.gameObject != go) tog.targetGraphic.enabled = false; } catch { } // checkbox box (never the row bg)
+                        try { UnityEngine.Object.Destroy(tog); } catch { } // remove the Selectable so a row-level Button (colour header) has no rival
+                    }
+                    return go;
+                }
+                catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] clone row chrome '{title}' failed: {ex.GetType().Name}: {ex.Message}"); }
+            }
+
+            // Fallback: a plain scratch row + label (no game chrome).
+            GameObject row = UiBuild.NewRect("MST Row " + title, _controlParent!);
+            TameRow(row, 46f);
+            GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, row.transform, title, UiTheme.LabelText, 16f, false, false);
+            LayoutInputLabel(lblGo, rightReserve);
+            titleTmp = lblGo.GetComponent<TextMeshProUGUI>();
+            return row;
+        }
+
+        // The persistent per-mod search box (right pane top strip), lives OUTSIDE the rebuilt scroll content so
+        // live-filtering keeps focus. Built FROM SCRATCH (not cloned) on purpose: cloning "any loaded
+        // TMP_InputField" pulled in, on the main menu, the money-HUD field, whose updater script kept rewriting
+        // the box with the game's "$0.<size=...>00" string and could not be reliably stripped off the clone. A
+        // scratch field carries zero game components, so it stays clean and left-aligned.
+        private static void BuildSearchField(Transform host)
+        {
+            try
+            {
+                // The "Search" label sits on the light settings strip, so it is near-black (the smoke report: the
+                // old faint-grey label was almost invisible there) and bold for legibility.
+                GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, host, "Search", new Color(0.06f, 0.06f, 0.09f, 1f), 16f, false, false);
+                RectTransform lrt = lblGo.GetComponent<RectTransform>();
+                if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(0f, 1f); lrt.pivot = new Vector2(0f, 0.5f); lrt.sizeDelta = new Vector2(70f, 0f); lrt.anchoredPosition = new Vector2(10f, 0f); }
+                TextMeshProUGUI? lt = lblGo.GetComponent<TextMeshProUGUI>();
+                if (lt != null) { lt.alignment = TextAlignmentOptions.MidlineLeft; try { lt.fontStyle = FontStyles.Bold; } catch { } }
+
+                // A taller well + text area gives the caret full vertical room (the smoke report: a half-height caret).
+                GameObject inGo = UiBuild.NewRect("MST SearchInput", host);
+                RectTransform irt = inGo.GetComponent<RectTransform>();
+                if (irt != null) { irt.anchorMin = new Vector2(0f, 0.06f); irt.anchorMax = new Vector2(1f, 0.94f); irt.offsetMin = new Vector2(80f, 0f); irt.offsetMax = new Vector2(-10f, 0f); }
+                Image bg = inGo.AddComponent<Image>();
+                if (bg != null) { bg.color = UiTheme.InputBg; bg.raycastTarget = true; }
+                Outline obg = inGo.AddComponent<Outline>();
+                if (obg != null) { obg.effectColor = UiTheme.InputOutline; obg.effectDistance = new Vector2(1f, -1f); }
+
+                GameObject area = UiBuild.NewRect("Text Area", inGo.transform);
+                RectTransform art = area.GetComponent<RectTransform>();
+                if (art != null) { art.anchorMin = Vector2.zero; art.anchorMax = Vector2.one; art.offsetMin = new Vector2(8f, 3f); art.offsetMax = new Vector2(-8f, -3f); }
+                area.AddComponent<RectMask2D>();
+
+                TextMeshProUGUI? txt = ConfigInputText(area.transform);
+
+                TMP_InputField input = inGo.AddComponent<TMP_InputField>();
+                if (input == null || txt == null) return;
+                input.textViewport = art;
+                input.textComponent = txt;
+                input.contentType = TMP_InputField.ContentType.Standard;
+                input.lineType = TMP_InputField.LineType.SingleLine;
+                input.characterLimit = 64;
+                ConfigInputCaret(input);
+                input.readOnly = false;
+                input.interactable = true;
+                input.SetTextWithoutNotify("");
+
+                UiListeners.OnValueChanged(input, OnFilterChanged); // live filter as the player types
+                _searchField = input;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[ModsTab] search box failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // The search box changed. DO NOT rebuild here: this fires from inside the TMP_InputField's own
+        // onValueChanged, and tearing down + rebuilding the page synchronously from within that callback corrupts
+        // the field's edit state, it deactivates after a single keystroke (the smoke report). Instead queue the
+        // rebuild for the next Tick (out of the input's event), which also lets us re-assert focus afterward.
+        private static void OnFilterChanged(string q)
+        {
+            _filterPending = (q ?? "").Trim();
+            _filterDirty = true;
+        }
+
+        // Apply a queued search rebuild, then keep the search box focused with the caret at the end so typing
+        // continues uninterrupted (the rebuild can drop EventSystem focus). Called from Tick(), never from the
+        // input's own callback. Staged edits survive the rebuild (they key on ConfigBinding, not the GameObject).
+        private static void ApplyPendingFilter()
+        {
+            _filterDirty = false;
+            try
+            {
+                if (string.Equals(_filterPending, _filter, StringComparison.Ordinal)) return;
+                _filter = _filterPending;
+                if (_selected != null) RebuildCurrentPage();
+            }
+            catch { }
+
+            // Re-assert focus only if the rebuild dropped it (deferring usually preserves it, so this is a no-op
+            // that doesn't disturb the caret); place the caret at the end so the next keystroke appends.
+            try
+            {
+                if (_searchField != null && !_searchField.isFocused)
+                {
+                    _searchField.ActivateInputField();
+                    int end = _searchField.text != null ? _searchField.text.Length : 0;
+                    _searchField.caretPosition = end;
+                    _searchField.selectionAnchorPosition = end;
+                    _searchField.selectionFocusPosition = end;
+                }
+            }
+            catch { }
+        }
+
+        // Filter a mod's settings: every whitespace-separated token of the query must match (case-insensitive
+        // substring) somewhere in the key / display label / description / section, so a multi-word query narrows
+        // progressively. A parse error fails open (returns all) rather than hiding settings.
+        private static List<ConfigBinding> FilterSettings(List<ConfigBinding> all, string query)
+        {
+            var matched = new List<ConfigBinding>();
+            try
+            {
+                string[] tokens = query.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (ConfigBinding b in all)
+                {
+                    string hay = (b.Key ?? "") + "\n" + (b.DisplayName ?? "") + "\n" + (b.Description ?? "") + "\n" + (b.Section ?? "");
+                    bool ok = true;
+                    foreach (string tk in tokens)
+                        if (hay.IndexOf(tk, StringComparison.OrdinalIgnoreCase) < 0) { ok = false; break; }
+                    if (ok) matched.Add(b);
+                }
+            }
+            catch { return all; }
+            return matched;
+        }
+
+        // ── staged save / discard ─────────────────────────────────────────────────────────────────────
 
         // Stage only an ACTUAL change; if a control is set back to its original value (or a text field is just
         // focused and left unedited), drop the stage so the mod isn't flagged dirty / the modal isn't raised.
-        private static void StageOrClear(ConfigBinding b, bool changed, Action apply)
+        // Effective is the value the entry WILL hold after Save, kept so the "modified" marker can compare
+        // against the default without touching the live entry. Refreshes the row marker either way.
+        private static void StageOrClear(ConfigBinding b, bool changed, object? effective, Action apply)
         {
-            if (changed) _staged[b] = apply;
+            if (changed) _staged[b] = new StagedEdit { Apply = apply, Effective = effective };
             else _staged.Remove(b);
+            UpdateMarker(b);
+        }
+
+        // The value a row effectively holds right now: its staged value if staged, else the live entry value.
+        private static object? EffectiveValue(ConfigBinding b)
+            => _staged.TryGetValue(b, out StagedEdit? e) ? e.Effective : b.Value;
+
+        // Modified only when we actually know the default (HasDefault) and the effective value differs from it,
+        // so an entry whose default we couldn't read shows neither a "modified" dot nor a (non-functional) reset.
+        private static bool IsModified(ConfigBinding b) => b.HasDefault && !ValuesEqual(EffectiveValue(b), b.Default);
+
+        // Index of the EFFECTIVE value (staged if staged, else live) within Choices, so a search rebuild repaints
+        // a staged dropdown pick, not the live one. Falls back to the live index.
+        private static int EffectiveChoiceIndex(ConfigBinding b)
+        {
+            try
+            {
+                string s = EffectiveValue(b)?.ToString() ?? "";
+                if (b.Choices != null)
+                    for (int i = 0; i < b.Choices.Length; i++)
+                        if (string.Equals(b.Choices[i], s, StringComparison.Ordinal)) return i;
+            }
+            catch { }
+            return b.CurrentChoiceIndex();
+        }
+
+        // Tolerant value-equality for the modified marker: numeric values compare as doubles within a small
+        // relative epsilon (a slider's float vs an int/double default); everything else compares by ToString.
+        private static bool ValuesEqual(object? a, object? b)
+        {
+            if (a == null && b == null) return true;
+            if (a == null || b == null) return false;
+            if (IsNumericValue(a) && IsNumericValue(b))
+            {
+                // Integral/decimal values compare EXACTLY (via decimal), a relative double tolerance can merge
+                // distinct large ulong/long/decimal values (two ulongs ~1e18 can differ by thousands yet fall
+                // under it), which would hide the modified marker and skip a real reset. Only fall back to the
+                // float tolerance when a float/double is actually involved.
+                bool aFloat = a is float || a is double;
+                bool bFloat = b is float || b is double;
+                if (!aFloat && !bFloat)
+                {
+                    try { return Convert.ToDecimal(a) == Convert.ToDecimal(b); } catch { }
+                }
+                try
+                {
+                    double da = Convert.ToDouble(a), db = Convert.ToDouble(b);
+                    double tol = Math.Max(1e-9, Math.Max(Math.Abs(da), Math.Abs(db)) * 1e-6);
+                    return Math.Abs(da - db) <= tol;
+                }
+                catch { }
+            }
+            string sa = a.ToString() ?? "";
+            string sb = b.ToString() ?? "";
+            if (string.Equals(sa, sb, StringComparison.Ordinal)) return true;
+            // Colour-aware: two colour strings of any format/case are equal when they parse to the same colour
+            // (so a colour row staged as canonical hex isn't flagged "modified" against a differently-cased default).
+            if (IsColorLike(sa) && IsColorLike(sb) && TryParseColor(sa, out Color ca) && TryParseColor(sb, out Color cb))
+            {
+                Color32 x = ca, y = cb;
+                return x.r == y.r && x.g == y.g && x.b == y.b && x.a == y.a;
+            }
+            return false;
+        }
+
+        private static bool IsNumericValue(object o)
+            => o is byte || o is sbyte || o is short || o is ushort || o is int || o is uint
+               || o is long || o is ulong || o is float || o is double || o is decimal;
+
+        // Toggle a row's "modified" dot and per-row Reset to match its current state. Safe to call before the
+        // row's widgets exist (during build), it no-ops until AddMetaLine registers them.
+        private static void UpdateMarker(ConfigBinding b)
+        {
+            try
+            {
+                if (!_rows.TryGetValue(b, out RowUi? r)) return;
+                bool modified = IsModified(b);
+                if (r.Dot != null && r.Dot.activeSelf != modified) r.Dot.SetActive(modified);
+                bool showReset = modified && !b.HideDefaultButton && CanReset(b);
+                if (r.Reset != null && r.Reset.activeSelf != showReset) r.Reset.SetActive(showReset);
+            }
+            catch { }
         }
 
         // Scale-aware change test for sliders: a fixed epsilon hides real edits on a tiny range (e.g. a 0..0.001
@@ -967,13 +1974,16 @@ namespace ModSettingsTool.UI
         private static void SaveStaged()
         {
             if (_staged.Count == 0) return;
-            foreach (KeyValuePair<ConfigBinding, Action> kv in _staged)
+            foreach (KeyValuePair<ConfigBinding, StagedEdit> kv in _staged)
             {
-                try { kv.Value(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] save '{kv.Key.Key}' failed: {ex.Message}"); }
+                try { kv.Value.Apply(); } catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] save '{kv.Key.Key}' failed: {ex.Message}"); }
             }
             int n = _staged.Count;
             _staged.Clear();
             Plugin.Logger.LogInfo($"[ModsTab] saved {n} staged mod setting(s) to the live config.");
+            // Mod Settings Tool's own [UI] keys (SettingOrder / ShowDescriptions) change how pages render; rebuild
+            // the current page so the change takes effect immediately rather than only on the next mod switch.
+            try { if (_selected != null && string.Equals(_selected.Guid, Plugin.PluginGuid, StringComparison.OrdinalIgnoreCase)) RebuildCurrentPage(); } catch { }
         }
 
         private static void DiscardStaged() => _staged.Clear();   // live entries were never touched
@@ -1177,10 +2187,17 @@ namespace ModSettingsTool.UI
 
         private static Transform? ModalParent()
         {
+            // Prefer the canvas our cloned tab panel lives under, context-agnostic, so the modal shows over
+            // BOTH the store Escape-menu Settings and the main-menu Settings. Fall back to the active Settings
+            // manager's canvas (the scene-aware finder), then to any canvas.
             try
             {
-                EscapeMenuManager? menu = EscapeMenuManager.HasInstance ? EscapeMenuManager.Instance : null;
-                SettingsMenuManager? sm = menu != null ? menu.settingsMenu : null;
+                if (_builtPanel != null)
+                {
+                    Canvas pc = _builtPanel.GetComponentInParent<Canvas>();
+                    if (pc != null) return pc.transform;
+                }
+                SettingsMenuManager? sm = FindSettingsManager();
                 if (sm != null) { Canvas c = sm.GetComponentInParent<Canvas>(); if (c != null) return c.transform; }
             }
             catch { }
@@ -1261,7 +2278,7 @@ namespace ModSettingsTool.UI
             _capturing = null;
             _capturingLabel = null;
             if (b == null) return;
-            StageOrClear(b, k.ToString() != (b.Value?.ToString() ?? ""), () => b.SetKey(k));
+            StageOrClear(b, k.ToString() != (b.Value?.ToString() ?? ""), k, () => b.SetKey(k));
             try { if (lbl != null) lbl.text = k.ToString(); } catch { }
         }
 
@@ -1445,7 +2462,7 @@ namespace ModSettingsTool.UI
 
         // ── cloned controls (Toggle / Slider, proven, unchanged) ─────────────────────────────────────
 
-        internal static void AddToggle(GameObject refToggle, Transform parent, string label, bool initial, Action<bool> onChange)
+        internal static Toggle? AddToggle(GameObject refToggle, Transform parent, string label, bool initial, Action<bool> onChange)
         {
             try
             {
@@ -1468,14 +2485,16 @@ namespace ModSettingsTool.UI
                     UiListeners.OnChanged(toggle, onChange); // replaces the cloned source's listeners + roots ours
                     toggle.SetIsOnWithoutNotify(initial);
                 }
+                return toggle;
             }
             catch (Exception ex)
             {
                 Plugin.Logger.LogWarning($"[ModsTab] toggle '{label}' failed: {ex.GetType().Name}: {ex.Message}");
+                return null;
             }
         }
 
-        internal static void AddSlider(GameObject refSlider, Transform parent, string label, float min, float max, float initial, bool wholeNumbers, Action<float> onChange)
+        internal static (Slider? slider, Action<float>? set) AddSlider(GameObject refSlider, Transform parent, string label, float min, float max, float initial, bool wholeNumbers, Action<float> onChange)
         {
             try
             {
@@ -1528,10 +2547,21 @@ namespace ModSettingsTool.UI
                 }
 
                 if (title != null) title.text = $"{label}: {Format(Mathf.Clamp(initial, min, max), wholeNumbers)}";
+
+                // A no-notify setter (value + the "label: value" title) for snap-to-default and colour-channel
+                // sync, programmatic sets must not fire onValueChanged (no spurious staging).
+                Action<float> set = v =>
+                {
+                    float c = wholeNumbers ? Mathf.Round(Mathf.Clamp(v, min, max)) : Mathf.Clamp(v, min, max);
+                    try { if (slider != null) slider.SetValueWithoutNotify(c); } catch { }
+                    if (title != null) title.text = $"{label}: {Format(c, wholeNumbers)}";
+                };
+                return (slider, set);
             }
             catch (Exception ex)
             {
                 Plugin.Logger.LogWarning($"[ModsTab] slider '{label}' failed: {ex.GetType().Name}: {ex.Message}");
+                return (null, null);
             }
         }
 

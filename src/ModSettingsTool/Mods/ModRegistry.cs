@@ -8,12 +8,12 @@ namespace ModSettingsTool.Mods
 {
     // Builds the installed-mod list the UI renders, from the BepInEx chainloader (plain managed API, not
     // IL2CPP-wrapped):
-    //   * IL2CPPChainloader.Instance.Plugins        -> the loaded mods (GUID, Name, Version, DLL path)
+    //   * IL2CPPChainloader.Instance.Plugins        -> the loaded mods (GUID, Name, Version, DLL path) = green
     //   * each plugin's BasePlugin.Config           -> its editable settings (via ConfigBinding)
-    //   * IL2CPPChainloader.Instance.DependencyErrors -> mods that FAILED to load (missing/incompatible deps)
-    //   * (optional) ModHealth.ScanLog()            -> mods that logged errors at runtime
-    // Read-only toward every other mod and the game; setting a value later goes through the live
-    // ConfigEntry, which is that mod's own object. Never throws.
+    //   * IL2CPPChainloader.Instance.DependencyErrors -> mods that FAILED to load (missing/incompatible deps) = red
+    // Health is binary: loaded = green, failed-to-load = red. Mod Settings Tool is a config manager, not a
+    // diagnostic tool, it does NOT scan the log or flag runtime warnings/errors. Read-only toward every other
+    // mod and the game; setting a value later goes through the live ConfigEntry, that mod's own object. Never throws.
     internal static class ModRegistry
     {
         // The latest snapshot, refreshed per scene by the Host and read by the views. Replaced wholesale,
@@ -34,7 +34,7 @@ namespace ModSettingsTool.Mods
             "Tobey.BepInEx.Timestamp",
         };
 
-        internal static List<ModInfo> Snapshot(bool scanLog)
+        internal static List<ModInfo> Snapshot()
         {
             var result = new List<ModInfo>();
             var byGuid = new Dictionary<string, ModInfo>(StringComparer.OrdinalIgnoreCase);
@@ -77,7 +77,9 @@ namespace ModSettingsTool.Mods
                     }
                     catch (Exception ex)
                     {
-                        mod.MarkUnhealthy($"config read failed ({ex.GetType().Name})");
+                        // The mod LOADED fine; we just couldn't read its config. It stays green (and shows
+                        // "No settings to change."), a read hiccup is not a load failure.
+                        Plugin.Logger.LogDebug($"[Registry] config read failed for '{mod.Name}' ({ex.GetType().Name}); listing it with no settings.");
                     }
 
                     result.Add(mod);
@@ -104,22 +106,6 @@ namespace ModSettingsTool.Mods
                             Health = HealthStatus.Unhealthy,
                             // .Issues seeded below so the dedup in MarkUnhealthy is consistent
                         }.WithIssue(err.Trim()));
-                    }
-                }
-
-                // 3. Optional log scan: errors mark unhealthy; warnings are advisory and only noted.
-                if (scanLog)
-                {
-                    Dictionary<string, ModHealth.Counts> log = ModHealth.ScanLog();
-                    if (log.Count > 0)
-                    {
-                        foreach (ModInfo mod in result)
-                        {
-                            if (string.IsNullOrEmpty(mod.Name)) continue;
-                            if (!log.TryGetValue(mod.Name, out ModHealth.Counts c)) continue;
-                            if (c.Errors > 0) mod.MarkUnhealthy($"{Plural(c.Errors, "error")} in the log");
-                            else if (c.Warnings > 0) mod.MarkWarning($"{Plural(c.Warnings, "warning")} in the log");
-                        }
                     }
                 }
             }
@@ -153,19 +139,22 @@ namespace ModSettingsTool.Mods
             return !string.IsNullOrEmpty(guid) && PackGuids.Contains(guid);
         }
 
-        // True if a dependency-error string names a known pack-bundled plugin, so its synthetic red entry is
-        // suppressed too. A future pack plugin not in the GUID set could still surface here (the folder match
-        // can't apply to a freeform error string), an accepted, low-likelihood gap, since the pack utilities
-        // effectively never fail to load.
+        // True only when the plugin that FAILED is itself a pack-bundled utility, so its synthetic red entry is
+        // suppressed. BepInEx phrases these as "Could not load [<failed plugin>] because it has missing
+        // dependencies: <dep guids>", the pack GUID can appear on EITHER side: as the failed plugin (suppress)
+        // or merely as a missing dependency of a real mod (must NOT suppress, or that mod is wrongly hidden
+        // instead of shown red). So match the GUID only in the HEAD of the message (before the dependency list),
+        // which names the failed plugin. A future pack plugin not in the GUID set could still surface (an
+        // accepted, low-likelihood gap, since the pack utilities effectively never fail to load).
         private static bool IsPackError(string err)
         {
+            string head = err;
+            int d = err.IndexOf("dependenc", StringComparison.OrdinalIgnoreCase); // "dependency" / "dependencies"
+            if (d >= 0) head = err.Substring(0, d);
             foreach (string guid in PackGuids)
-                if (err.IndexOf(guid, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (head.IndexOf(guid, StringComparison.OrdinalIgnoreCase) >= 0) return true;
             return false;
         }
-
-        // "1 error" / "2 errors", real singular/plural, not "error(s)".
-        private static string Plural(int n, string singular) => $"{n} {singular}{(n == 1 ? "" : "s")}";
 
         // Annotate a loaded mod if the error names its GUID or Name; else leave it for a synthetic entry. The
         // GUID is distinctive enough for a substring match, but the display name is matched as a WHOLE TOKEN so
@@ -200,8 +189,10 @@ namespace ModSettingsTool.Mods
 
         private static bool IsIdent(char c) => char.IsLetterOrDigit(c) || c == '_';
 
-        // Best-effort display name from a dependency-error string: the first single-quoted token, else a
-        // generic label (the full message is kept as the issue text regardless).
+        // Best-effort display name from a dependency-error string: the first single-quoted token, else the
+        // content of the first '[...]' bracket (BepInEx formats these as "Could not load [<Name> <Version>]
+        // because it has missing dependencies: <guid>", strip a trailing version token), else a generic label.
+        // The full message is kept as the issue text regardless.
         private static string NameFromError(string err)
         {
             try
@@ -212,12 +203,32 @@ namespace ModSettingsTool.Mods
                     int b = err.IndexOf('\'', a + 1);
                     if (b > a + 1) return err.Substring(a + 1, b - a - 1);
                 }
+
+                int lb = err.IndexOf('[');
+                if (lb >= 0)
+                {
+                    int rb = err.IndexOf(']', lb + 1);
+                    if (rb > lb + 1) return StripTrailingVersion(err.Substring(lb + 1, rb - lb - 1).Trim());
+                }
             }
             catch
             {
                 // fall through
             }
             return "Unloaded mod";
+        }
+
+        // "TestFailingMod 1.0.0" -> "TestFailingMod": drop a trailing token that looks like a version (starts
+        // with a digit, dots/digits only). Leaves a name with no version suffix untouched.
+        private static string StripTrailingVersion(string s)
+        {
+            int sp = s.LastIndexOf(' ');
+            if (sp <= 0 || sp >= s.Length - 1) return s;
+            string tail = s.Substring(sp + 1);
+            if (tail.Length == 0 || !char.IsDigit(tail[0])) return s;
+            foreach (char c in tail)
+                if (!char.IsDigit(c) && c != '.') return s;
+            return s.Substring(0, sp);
         }
     }
 

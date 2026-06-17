@@ -37,6 +37,30 @@ namespace ModSettingsTool.Config
         public double Max { get; }            // Slider only
         public string[] Choices { get; }      // EnumDropdown / ChoiceDropdown / KeyBind
 
+        // The entry's own declared default (ConfigEntryBase.DefaultValue), captured once. Drives the "modified"
+        // marker (live-or-staged != default) and Reset-to-default. May be null for an exotic entry.
+        public object? Default { get; }
+
+        // Whether DefaultValue was successfully captured, TRUE even when the default IS null (a nullable/string
+        // entry, which Reset must be able to apply), FALSE only when reading it threw (then we don't know the
+        // default, so Reset is not offered and never writes a bogus null).
+        public bool HasDefault { get; }
+
+        // De-facto ConfigurationManagerAttributes read from ConfigDescription.Tags (fail-soft reflection by
+        // member name; null = unspecified). Surface-everything: nothing here ever fully hides a setting.
+        public int? Order { get; }            // sort within a section (higher = earlier), ahead of SettingOrder
+        public string? DispName { get; }      // display label override (falls back to Key)
+        public string? Category { get; }      // optional sub-group within a section
+        public bool ReadOnly { get; }         // render the control read-only
+        public bool IsAdvanced { get; }       // IsAdvanced==true OR Browsable==false -> folded into "Advanced"
+        public bool HideDefaultButton { get; } // hide the per-row reset
+
+        // The label shown for this setting (the author's DispName when set, else the key).
+        public string DisplayName => string.IsNullOrEmpty(DispName) ? Key : DispName!;
+
+        // True when this binding carries a real numeric range (Slider, or a ranged numeric input).
+        public bool HasRange => Max > Min;
+
         private static readonly string[] NoChoices = Array.Empty<string>();
 
         public object? Value
@@ -105,9 +129,54 @@ namespace ModSettingsTool.Config
             return 0;
         }
 
+        // Index of the entry's DEFAULT within Choices (for the reset/snap of a dropdown); 0 if not found.
+        public int DefaultChoiceIndex()
+        {
+            try
+            {
+                string s = Default?.ToString() ?? "";
+                for (int i = 0; i < Choices.Length; i++)
+                    if (string.Equals(Choices[i], s, StringComparison.Ordinal)) return i;
+            }
+            catch { }
+            return 0;
+        }
+
+        // The typed value for a choice index (same conversion as SetChoice, but returned not written), used to
+        // compare a staged dropdown pick against the default for the modified marker. Null if out of range.
+        public object? ChoiceValue(int index)
+        {
+            try
+            {
+                if (Choices == null || index < 0 || index >= Choices.Length) return null;
+                if (Type.IsEnum) return Enum.Parse(Type, Choices[index]);
+                if (Type == typeof(string)) return Choices[index];
+                return Convert.ChangeType(Choices[index], Type);
+            }
+            catch { return null; }
+        }
+
+        // Stage-free reset: write the entry's OWN captured DefaultValue straight through BoxedValue (correct
+        // type, no parse, no clamp). Never writes the .cfg, BepInEx persists from the live entry on save.
+        // Gated on HasDefault, NOT on Default != null, so a genuine null default (a nullable/string entry) is
+        // applied (BoxedValue accepts null there) while a default we failed to read is never written as null.
+        public void ResetToDefault()
+        {
+            try { if (HasDefault) Entry.BoxedValue = Default!; } catch { }
+        }
+
         public void SetKey(UnityEngine.KeyCode key)
         {
-            try { Entry.BoxedValue = key; } catch { }
+            try
+            {
+                // Most KeyCode entries are UnityEngine.KeyCode; some IL2CPP mods use a distinct KeyCode enum
+                // type (same names/values). Box the value as the ENTRY's own enum type so BepInEx's typed setter
+                // doesn't reject a cross-type assignment (KeyCode's underlying type is int).
+                if (Type == typeof(UnityEngine.KeyCode)) Entry.BoxedValue = key;
+                else if (Type.IsEnum) Entry.BoxedValue = Enum.ToObject(Type, (int)key);
+                else Entry.BoxedValue = key;
+            }
+            catch { }
         }
 
         private ConfigBinding(ConfigEntryBase entry, string section, string key, string description,
@@ -122,6 +191,62 @@ namespace ModSettingsTool.Config
             Min = min;
             Max = max;
             Choices = choices;
+
+            try { Default = entry.DefaultValue; HasDefault = true; } catch { Default = null; HasDefault = false; }
+
+            // De-facto ConfigurationManagerAttributes (ConfigDescription.Tags). Fail-soft, by member name.
+            try
+            {
+                object[]? tags = SafeTags(entry);
+                if (tags != null)
+                {
+                    foreach (object? tag in tags)
+                    {
+                        if (tag == null) continue;
+                        Type tt = tag.GetType();
+                        if (!string.Equals(tt.Name, "ConfigurationManagerAttributes", StringComparison.Ordinal)) continue;
+                        Order = GetInt(tt, tag, "Order") ?? Order;
+                        DispName = GetStr(tt, tag, "DispName") ?? DispName;
+                        Category = GetStr(tt, tag, "Category") ?? Category;
+                        if (GetBool(tt, tag, "ReadOnly") == true) ReadOnly = true;
+                        if (GetBool(tt, tag, "IsAdvanced") == true) IsAdvanced = true;
+                        if (GetBool(tt, tag, "Browsable") == false) IsAdvanced = true; // non-browsable -> Advanced, never hidden
+                        if (GetBool(tt, tag, "HideDefaultButton") == true) HideDefaultButton = true;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static object[]? SafeTags(ConfigEntryBase e)
+        {
+            try { return e.Description?.Tags; } catch { return null; }
+        }
+
+        // Reflect a FIELD or PROPERTY by name (ConfigurationManagerAttributes uses public fields), fail-soft.
+        private static object? GetMember(Type t, object o, string name)
+        {
+            try { FieldInfo? f = t.GetField(name); if (f != null) return f.GetValue(o); } catch { }
+            try { PropertyInfo? p = t.GetProperty(name); if (p != null) return p.GetValue(o); } catch { }
+            return null;
+        }
+
+        private static int? GetInt(Type t, object o, string n)
+        {
+            object? v = GetMember(t, o, n);
+            try { return v == null ? (int?)null : Convert.ToInt32(v); } catch { return null; }
+        }
+
+        private static string? GetStr(Type t, object o, string n)
+        {
+            string? v = GetMember(t, o, n) as string;
+            return string.IsNullOrEmpty(v) ? null : v;
+        }
+
+        private static bool? GetBool(Type t, object o, string n)
+        {
+            object? v = GetMember(t, o, n);
+            return v is bool b ? b : (bool?)null;
         }
 
         // Build the binding list for one mod's ConfigFile (null/empty => no settings). Never throws.
@@ -148,11 +273,9 @@ namespace ModSettingsTool.Config
                 // leave whatever was gathered
             }
 
-            list.Sort((a, b) =>
-            {
-                int c = string.Compare(a.Section, b.Section, StringComparison.OrdinalIgnoreCase);
-                return c != 0 ? c : string.Compare(a.Key, b.Key, StringComparison.OrdinalIgnoreCase);
-            });
+            // PRESERVE the ConfigFile insertion order (the author's Bind() declaration order), the config-UI
+            // norm. The "Mods" tab re-orders for display per the [UI] SettingOrder key (author vs alphabetical)
+            // and the per-entry ConfigurationManagerAttributes Order, so no sort happens here.
             return list;
         }
 
@@ -172,8 +295,9 @@ namespace ModSettingsTool.Config
 
                 // KeyCode first: it IS an enum, but a ~300-item dropdown is awful, give it a rebind control,
                 // UNLESS the mod restricts it to an AcceptableValueList (then only a dropdown of the allowed
-                // keys keeps the choice inside the list).
-                if (t == typeof(UnityEngine.KeyCode))
+                // keys keeps the choice inside the list). IsKeyCode also catches interop variants of the type
+                // (some IL2CPP mods surface their hotkey as a distinct KeyCode enum) so those get the keycap too.
+                if (IsKeyCode(t))
                 {
                     string[]? keyChoices = ChoicesOf(av);
                     return keyChoices != null
@@ -189,7 +313,7 @@ namespace ModSettingsTool.Config
                 {
                     string[] enumChoices = ChoicesOf(av) ?? EnumNames(t);
                     if (t.IsDefined(typeof(FlagsAttribute), false))
-                        enumChoices = WithCurrentValue(entry, enumChoices);
+                        enumChoices = WithComboValues(entry, enumChoices);
                     return Make(entry, section, key, desc, t, ControlKind.EnumDropdown, enumChoices);
                 }
 
@@ -258,21 +382,45 @@ namespace ModSettingsTool.Config
             try { return Enum.GetNames(t); } catch { return NoChoices; }
         }
 
-        // Append the entry's current value (as a string) to choices if absent, for a [Flags] enum whose live
-        // value is a combination with no single named member, so the dropdown can show + re-select it
-        // (Enum.Parse handles the "A, B" form on commit).
-        private static string[] WithCurrentValue(ConfigEntryBase e, string[] choices)
+        // Append the entry's current AND default values (as strings) to choices if absent, for a [Flags] enum
+        // whose live or default value is a combination with no single named member (e.g. "Read, Write"), so the
+        // dropdown can show + re-select either (Enum.Parse handles the "A, B" form on commit). Including the
+        // default matters for Reset/snap: DefaultChoiceIndex must find the default combo or it snaps to option 0
+        // while Save applies the real default, a visible/staged mismatch.
+        private static string[] WithComboValues(ConfigEntryBase e, string[] choices)
         {
             try
             {
-                string cur = e.BoxedValue?.ToString() ?? "";
-                if (cur.Length == 0) return choices;
-                for (int i = 0; i < choices.Length; i++)
-                    if (string.Equals(choices[i], cur, StringComparison.Ordinal)) return choices;
-                var list = new List<string>(choices) { cur };
-                return list.ToArray();
+                var list = new List<string>(choices);
+                object? def = null; try { def = e.DefaultValue; } catch { }
+                AppendIfMissing(list, e.BoxedValue?.ToString() ?? "");
+                AppendIfMissing(list, def?.ToString() ?? "");
+                return list.Count == choices.Length ? choices : list.ToArray();
             }
             catch { return choices; }
+        }
+
+        private static void AppendIfMissing(List<string> list, string value)
+        {
+            if (value.Length == 0) return;
+            foreach (string c in list) if (string.Equals(c, value, StringComparison.Ordinal)) return;
+            list.Add(value);
+        }
+
+        // True for UnityEngine.KeyCode OR an interop variant of it: some IL2CPP mods surface their hotkey
+        // setting as a distinct KeyCode enum type (e.g. FullName "BepInEx.Unity.IL2CPP.UnityEngine.KeyCode").
+        // Matching any enum named "KeyCode" lets those render as the press-a-key keycap rather than a ~300-item
+        // enum dropdown (DF-06). Paired with the type-correct SetKey above.
+        private static bool IsKeyCode(Type t)
+        {
+            if (t == typeof(UnityEngine.KeyCode)) return true;
+            // Only a *UnityEngine.KeyCode (incl. IL2CPP-wrapped namespaces like "Il2CppUnityEngine.KeyCode" or
+            // "BepInEx.Unity.IL2CPP.UnityEngine.KeyCode") gets the press-a-key control. A mod's OWN enum that
+            // merely happens to be named "KeyCode" must stay an enum dropdown, SetKey writes UnityEngine.KeyCode
+            // numeric values, which would be undefined/wrong for an unrelated enum.
+            if (!t.IsEnum) return false;
+            string fn = t.FullName ?? "";
+            return fn.EndsWith("UnityEngine.KeyCode", StringComparison.Ordinal);
         }
 
         private static bool IsIntegral(Type t) =>

@@ -3,13 +3,13 @@ using ModSettingsTool.Config;
 
 namespace ModSettingsTool.Mods
 {
-    // Worst-wins severity. A mod's row is colored by the highest level it reaches: errors (load/dependency
-    // failures, config-read failures, log errors) -> Unhealthy (red); warnings (log warnings) -> Warning
-    // (amber); otherwise Healthy (green). Ordering matters, see MarkWarning/MarkUnhealthy.
+    // Binary load health. A mod is Unhealthy (red) ONLY when it actually FAILED TO LOAD (a chainloader
+    // load/dependency failure). Everything that loaded is Healthy (green), Mod Settings Tool is a config
+    // manager, not a diagnostic tool, so runtime log warnings/errors and config-read hiccups do NOT change
+    // the colour. No amber/Warning tier.
     internal enum HealthStatus
     {
         Healthy,
-        Warning,
         Unhealthy,
     }
 
@@ -25,30 +25,18 @@ namespace ModSettingsTool.Mods
         public bool Loaded;               // present in the chainloader's loaded set
 
         public HealthStatus Health = HealthStatus.Healthy;
-        public readonly List<string> Issues = new();          // shown after the name when Unhealthy
-        public List<ConfigBinding> Settings = new();          // editable config entries (sorted by section/key)
+        public readonly List<string> Issues = new();          // the load-failure reason(s), shown after the name when Unhealthy
+        public List<ConfigBinding> Settings = new();          // editable config entries (author declaration order; the tab re-orders for display)
 
         public bool HasSettings => Settings.Count > 0;
 
-        // Compact one-line issue text for the red "(info about the issue)" beside the name.
+        // Compact one-line issue text for the red "(why it failed to load)" beside the name.
         public string IssueSummary => Issues.Count == 0 ? "" : string.Join("; ", Issues);
 
-        // Red: errors always win, even over a prior warning.
+        // Red: the mod failed to load. The reason is kept as the issue text.
         public void MarkUnhealthy(string issue)
         {
             Health = HealthStatus.Unhealthy;
-            AddIssue(issue);
-        }
-
-        // Amber: raises a still-Healthy mod to Warning; never downgrades an already-Unhealthy one.
-        public void MarkWarning(string issue)
-        {
-            if (Health == HealthStatus.Healthy) Health = HealthStatus.Warning;
-            AddIssue(issue);
-        }
-
-        private void AddIssue(string issue)
-        {
             if (!string.IsNullOrWhiteSpace(issue) && !Issues.Contains(issue)) Issues.Add(issue);
         }
     }

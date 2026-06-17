@@ -18,7 +18,7 @@
     <AssemblyName>ModSettingsTool</AssemblyName>
     <RootNamespace>ModSettingsTool</RootNamespace>
     <Product>Mod Settings Tool</Product>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- CS1591: no XML doc gen. CS0436: the source nullable-attribute shim (Compat/NullableAttributesShim.cs)
          intentionally shadows Il2Cppmscorlib's broken copies. -->

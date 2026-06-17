@@ -7,11 +7,12 @@ on the current Unity 6 / IL2CPP version of the game.
 It has two parts:
 
 - **Main-menu mod list.** On the main menu, a list of your installed mods sits to the right of the menu
-  buttons. Each name is green when the mod is healthy, amber when it loaded with warnings, and red when it
-  failed, with the reason shown next to it. You can check your load order before you press Play.
-- **In-game Mods tab.** Press Escape in the store, open Settings, and click the Mods tab. Pick any
-  installed mod from the list and edit its settings on the right: toggles, sliders, dropdowns, text fields,
-  and keybinds you can rebind by pressing a key. A mod with no settings says "No settings to change."
+  buttons. Each name is green when the mod loaded and red when it failed to load, with the reason shown
+  next to it. You can check your load order before you press Play.
+- **Mods tab in Settings.** Open the Mods tab from the main-menu Settings page, or in the store press
+  Escape and open Settings. Pick any installed mod from the list and edit its settings on the right:
+  toggles, sliders, dropdowns, text fields, and keybinds you can rebind by pressing a key. A mod with no
+  settings says "No settings to change."
 
 ## How it works
 

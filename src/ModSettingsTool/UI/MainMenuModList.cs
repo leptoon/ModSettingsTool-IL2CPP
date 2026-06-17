@@ -8,9 +8,9 @@ using UnityEngine.UI;
 namespace ModSettingsTool.UI
 {
     // Part 1: a left-aligned installed-mod list shown on the MAIN MENU, to the right of the menu buttons,
-    // before loading a save. Each mod's name is green (Healthy) / amber (Warning) / red (Unhealthy); an
-    // unhealthy mod shows its issue text (ModInfo.IssueSummary) beside the name. Data comes from the Host's
-    // per-scene ModRegistry.Cache; this is cloned-uGUI (no IMGUI).
+    // before loading a save. Each mod's name is green (loaded) or red (failed to load), binary, no amber;
+    // a failed-to-load mod shows its failure reason (ModInfo.IssueSummary) beside the name. Data comes from
+    // the Host's per-scene ModRegistry.Cache; this is cloned-uGUI (no IMGUI).
     //
     // Surface mapped by the spike (docs/MOD_SETTINGS_GAME_SURFACE.md §C): FindObjectOfType<MainMenuManager>()
     // gives the "Menu" canvas; its six landing buttons are direct children (column at x=0). We parent a panel

@@ -48,7 +48,20 @@ namespace ModSettingsTool.UI
 
                 if (PatchGate.InMenu())
                 {
+                    // A runtime flip of [General] ShowMainMenuList must take effect live, both ways: build it when
+                    // on, tear it down when off. EnsureBuilt is idempotent; Invalidate no-ops when nothing is built.
                     if (Plugin.Settings.ShowMainMenuList.Value) MainMenuModList.EnsureBuilt();
+                    else MainMenuModList.Invalidate();
+
+                    // The Mods tab is injected into the main-menu Settings window too (same SettingsMenuManager
+                    // machinery as the store), so it needs the same per-frame Tick (rebind capture / dropdown
+                    // heal) and the throttled build poll here.
+                    ModsTab.Tick();
+                    if (Time.unscaledTime >= _nextPoll)
+                    {
+                        _nextPoll = Time.unscaledTime + PollInterval;
+                        ModsTab.Poll();
+                    }
                 }
                 else if (PatchGate.InStore())
                 {
@@ -75,14 +88,11 @@ namespace ModSettingsTool.UI
             // A cached snapshot the views read; refreshed per scene (mods don't load/unload mid-scene).
             try
             {
-                ModRegistry.Cache = ModRegistry.Snapshot(Plugin.Settings.ScanLogForHealth.Value);
-                int warn = 0, bad = 0;
+                ModRegistry.Cache = ModRegistry.Snapshot();
+                int bad = 0;
                 foreach (ModInfo m in ModRegistry.Cache)
-                {
                     if (m.Health == HealthStatus.Unhealthy) bad++;
-                    else if (m.Health == HealthStatus.Warning) warn++;
-                }
-                Plugin.Logger.LogInfo($"[Registry] scene '{scene}': {ModRegistry.Cache.Count} mods, {warn} warning, {bad} unhealthy.");
+                Plugin.Logger.LogInfo($"[Registry] scene '{scene}': {ModRegistry.Cache.Count} mods, {bad} failed to load.");
 
                 // The views must rebuild against the new scene's UI tree; release all bridged delegate roots
                 // from the old scene's destroyed UI (they are re-rooted as the new scene's views rebuild).

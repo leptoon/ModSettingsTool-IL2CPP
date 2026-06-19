@@ -7,7 +7,7 @@ It runs on the current version of the game and it is not guaranteed to be backwa
 It has two parts:
 
 - **Main-menu mod list.** On the main menu, a list of your installed mods sits to the right of the menu buttons. Each name is green when the mod loaded and red when it failed to load, with the reason shown next to it. You can check your load order before you press Play.
-- **Mods tab in Settings.** Open the Mods tab from the main-menu Settings page, or in the store press Escape and open Settings. Pick any installed mod from the list and edit its settings on the right: toggles, sliders, dropdowns, text fields, and keybinds you can rebind by pressing a key. A mod with no settings says "No settings to change."
+- **Mods tab in Settings.** Open the Mods tab from the main-menu Settings page, or in a game, singleplayer or co-op, press Escape and open Settings. Pick any installed mod from the list and edit its settings on the right: toggles, sliders, dropdowns, text fields, and keybinds you can rebind by pressing a key. A mod with no settings says "No settings to change."
 
 ## How it works
 
@@ -54,7 +54,7 @@ For the BepInEx config API the mod is built on and the in-game UI surface it hoo
 
 ## Compatibility
 
-Mod Settings Tool loads through BepInEx, so a large game update can break it until it is rebuilt. If your mods stop loading after an update, check back here for a new build. The tool is built for singleplayer.
+Mod Settings Tool loads through BepInEx, so a large game update can break it until it is rebuilt. If your mods stop loading after an update, check back here for a new build. The tool works in both singleplayer and co-op; in co-op your edits are saved locally, and some mods only apply changes on the host.
 
 ## License
 

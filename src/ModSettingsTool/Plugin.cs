@@ -18,7 +18,7 @@ namespace ModSettingsTool
     {
         public const string PluginGuid = "com.leptoon.modsettingstool";
         public const string PluginName = "Mod Settings Tool";
-        public const string PluginVersion = "0.2.0";
+        public const string PluginVersion = "0.3.0";
 
         internal static ManualLogSource Logger = null!;
         internal static ModConfig Settings = null!;

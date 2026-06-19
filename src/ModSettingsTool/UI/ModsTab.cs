@@ -476,6 +476,7 @@ namespace ModSettingsTool.UI
             UiListeners.BeginPageScope();
             try
             {
+                if (PatchGate.InCoop()) AddCoopNotice();
                 BuildHeaderCard(mod);
                 if (!mod.HasSettings) return; // the header card already shows "No settings to change."
 
@@ -546,6 +547,23 @@ namespace ModSettingsTool.UI
                 UiListeners.EndPageScope();
                 UiBuild.ResetScrollAndRefreshHint(_rightContent); // page just (re)built, scroll to top + refresh the hint
             }
+        }
+
+        // A one-line co-op advisory pinned to the top of every Mods-tab page while in the co-op store. The tab
+        // works exactly as in singleplayer: edits write to each mod's live ConfigEntry and BepInEx saves them
+        // locally, but a mod may only ACT on a changed value on the host (the authoritative session), so the
+        // notice sets expectations. Informational ONLY: nothing is blocked or hidden.
+        private static void AddCoopNotice()
+        {
+            try
+            {
+                if (_rightContent == null || _labelTemplate == null) return;
+                Color bg = UiTheme.Accent; bg.a = 0.16f;
+                UiBuild.MakeBanner(_labelTemplate, _rightContent,
+                    "Co-op session: settings save locally. Some mods only apply changes on the host, so a change may not take effect for everyone.",
+                    UiTheme.Accent, bg);
+            }
+            catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] co-op notice failed: {ex.GetType().Name}: {ex.Message}"); }
         }
 
         // A "Debug" section is always pushed to the very bottom (below Advanced) and collapsed by default, its

@@ -11,9 +11,10 @@
 |---|---|---|
 | `Main Menu` | the main menu | **Part 1**, the installed-mod list (§C) **+ Part 2**, the "Mods" tab in the main-menu Settings window (§B2) |
 | `Main Scene` | singleplayer store | **Part 2**, the Escape-menu "Mods" tab (surface PROVEN, see §B) |
-| `Multiplayer` | co-op | inert |
+| `Multiplayer` | co-op store (host + client both load it) | **Part 2**, the same Escape-menu "Mods" tab, plus a one-line co-op advisory; editing is local (see §E) |
 
-`Patches/PatchGate.cs` gates by scene name (`InMenu()` / `InStore()`).
+`Patches/PatchGate.cs` gates by scene name: `InMenu()` (main menu), `InStore()` (either store scene,
+singleplayer `Main Scene` or co-op `Multiplayer`), and `InCoop()` (co-op only, for the advisory).
 
 ## B. Escape-menu Settings tab (PROVEN, ported from RDC Stock Manager)
 
@@ -131,3 +132,19 @@ control, each persistent-listener-safe (`UI/UiListeners.cs`) and staged (written
 
 Every edit writes `ConfigBinding.Value` (the live `ConfigEntry.BoxedValue`), only on Save. The Escape-menu
 close path is guarded in `Patches/MenuPatches.cs` (`SettingsMenuManager.set_Enable`).
+
+## E. Co-op (the `Multiplayer` store scene)
+
+Co-op runs in a separate scene named `Multiplayer`, which the host and joining clients both load. The game's
+netcode is Photon PUN (`Photon.Pun.PhotonNetwork`), but Mod Settings Tool does not reference it: the tool is a
+LOCAL config editor, so the in-store "Mods" tab is enabled in `Multiplayer` exactly as in `Main Scene`
+(`PatchGate.InStore()` matches either store scene). Edits write to each mod's live `ConfigEntry` and BepInEx
+persists them locally, on the host or a client alike, so co-op needs no networking or host/client role
+detection.
+
+Nothing is blocked or hidden in co-op: every installed mod is listed and editable, the same as singleplayer.
+There is no general way to tell whether some other mod acts on a given setting in co-op, and a `BoxedValue`
+write is always locally valid, so the tool shows a single informational banner at the top of each Mods-tab
+page (`ModsTab.AddCoopNotice`, gated on `PatchGate.InCoop()`) rather than gating per mod: "Co-op session:
+settings save locally. Some mods only apply changes on the host...". The main-menu list (Part 1) is
+unaffected; it lives in the `Main Menu` scene, shared by both modes.

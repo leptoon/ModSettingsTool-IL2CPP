@@ -2,6 +2,14 @@
 
 All notable changes to Mod Settings Tool. The newest release is at the top. Dates are year-month-day.
 
+## 0.3.0 (2026-06-19)
+
+### Added
+
+- Co-op support. Open the Mods tab in a co-op game (press Escape, then Settings) to edit any mod's settings.
+  Edits save locally through each mod's own config, and a note on each mod's page reminds you that some mods
+  only apply changes on the host.
+
 ## 0.2.0 (2026-06-17)
 
 This release brings the Mods tab to the main menu, reworks the right pane, simplifies mod health to

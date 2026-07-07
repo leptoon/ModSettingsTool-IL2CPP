@@ -2,6 +2,37 @@
 
 All notable changes to Mod Settings Tool. The newest release is at the top. Dates are year-month-day.
 
+## 0.4.0 (2026-07-07)
+
+This release localizes Mod Settings Tool's own UI and config text, and makes its BepInEx config easier to
+read without losing existing settings.
+
+### Added
+
+- Localization for Mod Settings Tool's own labels, prompts, tooltips, status text, popups, config labels, and
+  config descriptions.
+- Support for the current Steam-listed Supermarket Simulator interface languages, with English as the
+  authoritative fallback.
+- Runtime language detection from the game's selected locale when available, with sensible aliases for Steam
+  and Unity language codes.
+- A saved language cache so BepInEx config descriptions can use the last detected language on the next launch.
+
+### Changed
+
+- The tool's own config keys now use clearer names:
+  `[General] Enable Mod Settings Tool`, `[Main Menu] Show Mod List`, `[Interface] Settings Order`,
+  `[Interface] Show Setting Descriptions`, and `[Localization] Detected Language Cache`.
+- Existing values migrate from the old keys automatically, including `[General] Enabled`,
+  `[MainMenu] ShowModList`, `[UI] SettingOrder`, and `[UI] ShowDescriptions`.
+- Visible UI text refreshes when the game language changes during a scene instead of waiting for a scene
+  change.
+
+### Notes
+
+- Other mods' names, config labels, config descriptions, GUIDs, and values are still shown exactly as those
+  mods provide them.
+- Old Mod Settings Tool config keys are left in the `.cfg` as harmless rollback data after migration.
+
 ## 0.3.0 (2026-06-19)
 
 ### Added

@@ -1,0 +1,182 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "enabled_providers": [
+    "opencode-go",
+    "cursor"
+  ],
+  "model": "cursor/composer-2.5",
+  "small_model": "opencode-go/deepseek-v4.1-flash",
+  "default_agent": "build",
+  "subagent_depth": 1,
+  "share": "disabled",
+  "snapshot": true,
+  "instructions": [
+    "AGENTS.md",
+    ".claude/skills/ARCHITECTURE_INVARIANTS.md"
+  ],
+  "watcher": {
+    "ignore": [
+      "**/bin/**",
+      "**/obj/**",
+      "build/**",
+      "artifacts/**",
+      ".git/**",
+      "UnityProject/Library/**",
+      "UnityProject/Temp/**"
+    ]
+  },
+  "tool_output": {
+    "max_lines": 350,
+    "max_bytes": 28000
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "tail_turns": 4,
+    "preserve_recent_tokens": 16000,
+    "reserved": 12000
+  },
+  "permission": {
+    "*": "allow",
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow",
+      "**/local.properties": "deny",
+      "**/google-services.json": "deny",
+      "**/*.keystore": "deny",
+      "**/*.jks": "deny",
+      "**/secrets/**": "deny"
+    },
+    "edit": {
+      "*": "allow",
+      "**/Windows/**": "deny",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow",
+      "**/local.properties": "deny",
+      "**/google-services.json": "deny",
+      "**/*.keystore": "deny",
+      "**/*.jks": "deny",
+      "**/secrets/**": "deny"
+    },
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "bash": {
+      "*": "allow",
+      "*gh repo delete*": "deny",
+      "*gh.exe repo delete*": "deny",
+      "*gh api*DELETE*": "deny",
+      "*gh api*delete*": "deny",
+      "*gh.exe api*DELETE*": "deny",
+      "*gh.exe api*delete*": "deny",
+      "*api.github.com*DELETE*": "deny",
+      "*api.github.com*delete*": "deny",
+      "*curl*-X DELETE*": "deny",
+      "*curl*-XDELETE*": "deny",
+      "*curl*--request DELETE*": "deny",
+      "*curl*--request=DELETE*": "deny",
+      "*Invoke-RestMethod*-Method Delete*": "deny",
+      "*Invoke-WebRequest*-Method Delete*": "deny"
+    },
+    "task": "allow",
+    "external_directory": "allow",
+    "todowrite": "allow",
+    "question": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "lsp": "allow",
+    "doom_loop": "allow",
+    "skill": "allow"
+  },
+  "agent": {
+    "general": {
+      "disable": true
+    },
+    "plan": {
+      "description": "Read-only planning and task-contract agent",
+      "mode": "primary",
+      "model": "cursor/composer-2.5",
+      "steps": 36,
+      "color": "primary",
+      "prompt": "Plan and contract only for SuperStructures development repository. Auto-loaded policy is AGENTS.md plus ARCHITECTURE_INVARIANTS; read CLAUDE.md before substantial work, contracts, verification, and PR/merge steps.  inspect the smallest useful set of files, identify invariants and blast radius, and draft or revise the repo-native task contract. Do not edit product code or begin implementation. Stop for explicit acceptance."
+    },
+    "build": {
+      "description": "Primary contract owner, implementer, integrator, and verifier",
+      "mode": "primary",
+      "model": "cursor/composer-2.5",
+      "steps": 115,
+      "color": "success",
+      "prompt": "Auto-loaded policy is AGENTS.md plus ARCHITECTURE_INVARIANTS; read CLAUDE.md before substantial work, contracts, verification, and PR/merge steps. Own the task contract, integration, and final verification for SuperStructures development repository. For substantial work, product edits require an accepted contract and the user's exact authorization phrase \"the box is yours\"; contract-file edits may happen before authorization. Use targeted search instead of broad repository ingestion. The primary agent alone owns loader/core architecture, structure placement, navigation, stairs/elevators, save compatibility, asset injection, IL2CPP hooks, and game verification. Tools and probes may be delegated independently. Delegate only genuinely independent paths, reconcile every subagent result yourself, run the canonical gates, and record exact evidence. Never commit, push, merge, publish, or weaken a stop condition."
+    },
+    "fallback-builder": {
+      "description": "Alternate primary builder used only after repeated failure or explicit selection",
+      "mode": "primary",
+      "model": "opencode-go/glm-5.3",
+      "steps": 115,
+      "color": "warning",
+      "prompt": "Use only after two materially different failed attempts by the normal builder, or when explicitly selected. Re-read the accepted contract and failure evidence for SuperStructures development repository; form a different hypothesis without broadening scope. The primary agent alone owns loader/core architecture, structure placement, navigation, stairs/elevators, save compatibility, asset injection, IL2CPP hooks, and game verification. Tools and probes may be delegated independently. Never commit, push, merge, or publish."
+    },
+    "explore": {
+      "description": "Fast, read-only repository explorer",
+      "mode": "subagent",
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "steps": 24,
+      "color": "info",
+      "prompt": "Explore SuperStructures development repository narrowly. Prefer rg, globs, manifests, symbols, and short excerpts. Return relevant paths, relationships, and evidence; never bulk-read the repository or propose edits."
+    },
+    "scout": {
+      "description": "Read-only official documentation and upstream dependency researcher",
+      "mode": "subagent",
+      "model": "opencode-go/gpt-6-luna",
+      "steps": 24,
+      "color": "secondary",
+      "prompt": "Research only the external dependency or platform question assigned for SuperStructures development repository. Prefer official documentation and upstream source, distinguish facts from inference, and return concise citations and version constraints."
+    },
+    "review": {
+      "description": "Read-only adversarial review before merge or owner handoff",
+      "mode": "subagent",
+      "model": "cursor/composer-2.5",
+      "steps": 36,
+      "color": "accent",
+      "prompt": "Review only the accepted contract, diff, and verification evidence for SuperStructures development repository. Prioritize correctness, invariant violations, security, regressions, and missing tests. Do not edit files; return actionable findings with paths and severity."
+    },
+    "tooling-writer": {
+      "description": "Scoped tooling and probe writer",
+      "mode": "subagent",
+      "model": "cursor/composer-2.5",
+      "steps": 55,
+      "color": "warning",
+      "prompt": "Implement one independently assigned tool or probe. Do not modify production loader/core code, gameplay behavior, save data, assets, navigation, or runtime hooks. Work only inside the assigned paths, do not broaden scope, do not alter task contracts or shared invariants, and return changed paths plus verification evidence to the primary agent."
+    }
+  },
+  "command": {
+    "contract": {
+      "description": "Draft or revise a task contract without implementing",
+      "agent": "plan",
+      "template": "For $ARGUMENTS, inspect only high-signal files, draft or revise the repo-native task contract, list unresolved policy-changing questions and stop conditions, and stop before implementation."
+    },
+    "verify": {
+      "description": "Run the repository's canonical validation gates",
+      "agent": "build",
+      "template": "Verify the current accepted task for SuperStructures development repository. Run the canonical checks from the loaded instructions in their required order. Do not substitute weaker checks, repair unrelated failures, commit, or push. Report exact commands, results, and blockers."
+    },
+    "handoff": {
+      "description": "Prepare a compact ChatGPT Plus/Codex escalation packet",
+      "agent": "review",
+      "subtask": true,
+      "template": "Prepare a compact escalation packet for ChatGPT Plus/Codex containing the accepted contract, relevant diff paths, verification evidence, failure history, invariant risks, and the precise question requiring a stronger model. Do not include unrelated repository content."
+    }
+  },
+  "plugin": [
+    "@openchamber/opencode-cursor"
+  ],
+  "references": {
+    "superstructures-sibling": {
+      "path": "C:/Users/Andrew/Documents/SuperStructure",
+      "description": "Sibling SMS mod process template (agents, contracts, gates); this repo's CLAUDE.md wins on conflict."
+    }
+  }
+}

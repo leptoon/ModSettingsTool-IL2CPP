@@ -1,0 +1,61 @@
+{
+  "profilesVersion": 1,
+  "profiles": {
+    "docs-only": {
+      "description": "Documentation, policy, template, and lightweight workflow changes that do not touch runtime code.",
+      "defaultRequiredReads": [
+        { "path": "AGENTS.md", "kind": "file", "status": "exists" }
+      ],
+      "verificationCommands": [
+        { "cwd": ".", "command": "node scripts/check-agent-task-contracts.mjs" },
+        { "cwd": ".", "command": "node scripts/check-whitespace.mjs", "reason": "Whitespace gate." }
+      ],
+      "defaultStopConditions": [
+        "Pause if the work expands beyond documentation, policy, templates, or scripts.",
+        "Pause if validation requires secrets, the game installation, or external services."
+      ]
+    },
+    "mod-build": {
+      "description": "Changes to the Mod Settings Tool IL2CPP plugin source.",
+      "defaultRequiredReads": [
+        { "path": "AGENTS.md", "kind": "file", "status": "exists" },
+        { "path": ".claude/skills/ARCHITECTURE_INVARIANTS.md", "kind": "file", "status": "exists" },
+        { "path": "README.md", "kind": "file", "status": "exists" }
+      ],
+      "verificationCommands": [
+        { "cwd": ".", "command": "node scripts/check-agent-task-contracts.mjs" },
+        { "cwd": ".", "command": "node scripts/check-whitespace.mjs", "reason": "The committed diff must be whitespace-clean." }
+      ],
+      "defaultStopConditions": [
+        "Pause if BepInEx pack DLLs, generated interop DLLs, or game-install files are about to be committed."
+      ]
+    },
+    "runtime-smoke": {
+      "description": "Changes requiring in-game verification (owner-run smoke).",
+      "defaultRequiredReads": [
+        { "path": "AGENTS.md", "kind": "file", "status": "exists" }
+      ],
+      "verificationCommands": [
+        { "cwd": ".", "command": "node scripts/check-agent-task-contracts.mjs" },
+        { "cwd": ".", "command": "node scripts/check-whitespace.mjs", "reason": "Whitespace gate." }
+      ],
+      "defaultStopConditions": [
+        "Pause if the game is not installed and the owner is unavailable to run smoke locally."
+      ]
+    },
+    "spike": {
+      "description": "Throwaway instrumentation spikes (never shipped).",
+      "defaultRequiredReads": [
+        { "path": "AGENTS.md", "kind": "file", "status": "exists" },
+        { "path": ".claude/skills/ARCHITECTURE_INVARIANTS.md", "kind": "file", "status": "exists" }
+      ],
+      "verificationCommands": [
+        { "cwd": ".", "command": "node scripts/check-agent-task-contracts.mjs" },
+        { "cwd": ".", "command": "node scripts/check-whitespace.mjs", "reason": "Spike source is committed; keep whitespace-clean." }
+      ],
+      "defaultStopConditions": [
+        "Pause if the spike would mutate game save data."
+      ]
+    }
+  }
+}

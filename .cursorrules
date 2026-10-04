@@ -1,0 +1,20 @@
+# ModSettingsTool-IL2CPP — Cursor / agent rules
+
+## Context tiers
+
+- **Auto-read:** `AGENTS.md` and `.claude/skills/ARCHITECTURE_INVARIANTS.md`.
+- **On demand:** `CLAUDE.md` (authoritative manifest — wins on conflict), plus `docs/*` per CLAUDE.md § Conditional reads.
+- OpenCode setup: `docs/OPENCODE.md`. MCP parameter names: `docs/AGENT-TOOLS.md`.
+
+## OpenCode MCP (Cursor bridge)
+
+When this workspace is driven through OpenCode (`@openchamber/opencode-cursor`), use **only** OpenCode MCP tools (`read`, `grep`, `glob`, `bash`, `write`, `edit`, `skill`, `opencode_task`) — not native Cursor file/shell tools. `read` uses `filePath` (not `path`). Project root is the shell cwd (worktrees included).
+
+## Policy
+
+- Never trigger Codex, `@codex review`, or other bot/cloud reviews unless the owner explicitly asked in this session.
+- Do not commit, push, merge, or publish unless the owner asked.
+
+## Windows
+
+Primary clone: `C:/Users/Andrew/Documents/ModSettingsTool-IL2CPP`.

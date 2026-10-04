@@ -19,10 +19,8 @@ local.props
 # Decompiled game / BepInEx corpus (regenerate with ilspycmd; never committed).
 /.gamedump/
 
-# Local agent instructions and session artifacts. Not published.
+# Local owner manifest (not published). Committed bootstrap: AGENTS.md + .claude/skills/.
 CLAUDE.md
-AGENTS.md
-.claude/
 
 # Root-level npm / tooling noise.
 /node_modules/

@@ -1,0 +1,507 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rdcstockmanager.local/schemas/agent-task.schema.json",
+  "title": "Mod Settings Tool Agent Task Contract",
+  "description": "Lightweight machine-readable contract for substantial agent tasks in the RDC Stock Manager repository.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "title",
+    "status",
+    "summary",
+    "scope",
+    "outOfScope",
+    "changeTypes",
+    "blastRadius",
+    "repositories",
+    "requiredReads",
+    "expectedTouchedPaths",
+    "requiredCompanions",
+    "outOfScopePaths",
+    "verificationProfile",
+    "extraCommands",
+    "acceptanceCriteria",
+    "stopConditions",
+    "knownAllowedFailures",
+    "environmentBlockers",
+    "humanDecisions",
+    "discoveredFacts",
+    "openQuestions",
+    "risks",
+    "prPolicy",
+    "verificationResults"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^TASK-[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "accepted", "in_progress", "blocked", "completed", "withdrawn"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "outOfScope": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "changeTypes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "docs",
+          "tooling",
+          "framework",
+          "expansion-api",
+          "harmony-patch",
+          "il2cpp-interop",
+          "unity-assets",
+          "legacy",
+          "bugfix",
+          "refactor",
+          "workflow",
+          "release-ops"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "blastRadius": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "framework",
+        "expansionApi",
+        "harmonyPatches",
+        "il2cppInterop",
+        "unityAssets",
+        "docs",
+        "tooling",
+        "legacy"
+      ],
+      "properties": {
+        "framework": {
+          "type": "boolean"
+        },
+        "expansionApi": {
+          "type": "boolean"
+        },
+        "harmonyPatches": {
+          "type": "boolean"
+        },
+        "il2cppInterop": {
+          "type": "boolean"
+        },
+        "unityAssets": {
+          "type": "boolean"
+        },
+        "docs": {
+          "type": "boolean"
+        },
+        "tooling": {
+          "type": "boolean"
+        },
+        "legacy": {
+          "type": "boolean"
+        }
+      }
+    },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/repository"
+      }
+    },
+    "requiredReads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pathEntry"
+      }
+    },
+    "expectedTouchedPaths": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/pathEntry"
+      }
+    },
+    "requiredCompanions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pathEntry"
+      }
+    },
+    "outOfScopePaths": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pathEntry"
+      }
+    },
+    "verificationProfile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "extraCommands": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/commandEntry"
+      }
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/acceptanceCriterion"
+      }
+    },
+    "stopConditions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/stopCondition"
+      }
+    },
+    "knownAllowedFailures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/knownAllowedFailure"
+      }
+    },
+    "environmentBlockers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/environmentBlocker"
+      }
+    },
+    "humanDecisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/humanDecision"
+      }
+    },
+    "discoveredFacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/discoveredFact"
+      }
+    },
+    "openQuestions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/openQuestion"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/risk"
+      }
+    },
+    "prPolicy": {
+      "$ref": "#/$defs/prPolicy"
+    },
+    "verificationResults": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/verificationResult"
+      }
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "role", "verificationProfile", "extraCommands"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "enum": ["primary", "companion", "external"]
+        },
+        "verificationProfile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "extraCommands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/commandEntry"
+          }
+        }
+      }
+    },
+    "pathEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "status"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["file", "directory", "glob"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["exists", "to_create", "external"]
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "commandEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cwd", "command"],
+      "properties": {
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "verification", "status"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^AC-[0-9]{2}$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verification": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "met", "blocked", "not_applicable"]
+        }
+      }
+    },
+    "stopCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "condition"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^SC-[0-9]{2}$"
+        },
+        "condition": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "knownAllowedFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "reason"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string"
+        }
+      }
+    },
+    "environmentBlocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "impact", "fallback"],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "impact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fallback": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "humanDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "decision", "decidedAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^HD-[0-9]{2}$"
+        },
+        "decision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "decidedAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        }
+      }
+    },
+    "discoveredFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fact", "source"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^DF-[0-9]{2}$"
+        },
+        "fact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "openQuestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "question", "blocking", "owner", "status"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^OQ-[0-9]{2}$"
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": ["open", "answered", "not_applicable"]
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "risk", "mitigation"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^R-[0-9]{2}$"
+        },
+        "risk": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mitigation": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "prPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draftPrRequired", "baseBranch", "mergeRequiresUserRequest", "requiredBodyNotes"],
+      "properties": {
+        "draftPrRequired": {
+          "type": "boolean"
+        },
+        "baseBranch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mergeRequiresUserRequest": {
+          "type": "boolean"
+        },
+        "requiredBodyNotes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "verificationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "outcome", "notes"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "enum": ["passed", "failed", "blocked", "not_run"]
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

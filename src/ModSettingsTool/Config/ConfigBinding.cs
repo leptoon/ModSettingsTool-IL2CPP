@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using BepInEx.Configuration;
+using ModSettingsTool.Localization;
 
 namespace ModSettingsTool.Config
 {
@@ -28,6 +29,7 @@ namespace ModSettingsTool.Config
     internal sealed class ConfigBinding
     {
         public ConfigEntryBase Entry { get; }
+        public string OwnerGuid { get; }
         public string Section { get; }
         public string Key { get; }
         public string Description { get; }
@@ -55,8 +57,25 @@ namespace ModSettingsTool.Config
         public bool IsAdvanced { get; }       // IsAdvanced==true OR Browsable==false -> folded into "Advanced"
         public bool HideDefaultButton { get; } // hide the per-row reset
 
-        // The label shown for this setting (the author's DispName when set, else the key).
-        public string DisplayName => string.IsNullOrEmpty(DispName) ? Key : DispName!;
+        public bool IsModSettingsToolSetting =>
+            string.Equals(OwnerGuid, Plugin.PluginGuid, StringComparison.OrdinalIgnoreCase) &&
+            ModConfigDefinitions.IsOwnSectionKey(Section, Key);
+
+        // The label shown for this setting (our localized label for our config; otherwise the author's DispName
+        // when set, else the raw key). Other mods' authored config text is never localized here.
+        public string DisplayName => IsModSettingsToolSetting
+            ? ModConfigDefinitions.KeyLabel(Section, Key)
+            : string.IsNullOrEmpty(DispName) ? Key : DispName!;
+
+        public string DisplaySection => IsModSettingsToolSetting
+            ? ModConfigDefinitions.SectionLabel(Section)
+            : string.IsNullOrEmpty(Section) ? I18n.T("ui.generalSection") : Section;
+
+        public string DisplayDescription => IsModSettingsToolSetting
+            ? ModConfigDefinitions.Description(Section, Key, Description)
+            : Description;
+
+        public string[] ChoiceLabels => ModConfigDefinitions.ChoiceLabels(OwnerGuid, Section, Key, Choices);
 
         // True when this binding carries a real numeric range (Slider, or a ranged numeric input).
         public bool HasRange => Max > Min;
@@ -179,10 +198,11 @@ namespace ModSettingsTool.Config
             catch { }
         }
 
-        private ConfigBinding(ConfigEntryBase entry, string section, string key, string description,
+        private ConfigBinding(ConfigEntryBase entry, string ownerGuid, string section, string key, string description,
                               Type type, ControlKind kind, double min, double max, string[] choices)
         {
             Entry = entry;
+            OwnerGuid = ownerGuid;
             Section = section;
             Key = key;
             Description = description;
@@ -250,7 +270,7 @@ namespace ModSettingsTool.Config
         }
 
         // Build the binding list for one mod's ConfigFile (null/empty => no settings). Never throws.
-        public static List<ConfigBinding> FromConfigFile(ConfigFile? config)
+        public static List<ConfigBinding> FromConfigFile(ConfigFile? config, string ownerGuid)
         {
             var list = new List<ConfigBinding>();
             if (config == null) return list;
@@ -264,7 +284,7 @@ namespace ModSettingsTool.Config
 
                 foreach (ConfigEntryBase entry in entries)
                 {
-                    ConfigBinding? b = TryClassify(entry);
+                    ConfigBinding? b = TryClassify(entry, ownerGuid);
                     if (b != null) list.Add(b);
                 }
             }
@@ -279,7 +299,7 @@ namespace ModSettingsTool.Config
             return list;
         }
 
-        private static ConfigBinding? TryClassify(ConfigEntryBase entry)
+        private static ConfigBinding? TryClassify(ConfigEntryBase entry, string ownerGuid)
         {
             try
             {
@@ -301,8 +321,8 @@ namespace ModSettingsTool.Config
                 {
                     string[]? keyChoices = ChoicesOf(av);
                     return keyChoices != null
-                        ? Make(entry, section, key, desc, t, ControlKind.EnumDropdown, keyChoices)
-                        : Make(entry, section, key, desc, t, ControlKind.KeyBind, EnumNames(t));
+                        ? Make(entry, ownerGuid, section, key, desc, t, ControlKind.EnumDropdown, keyChoices)
+                        : Make(entry, ownerGuid, section, key, desc, t, ControlKind.KeyBind, EnumNames(t));
                 }
 
                 // Enum: a dropdown of the AcceptableValueList subset when the mod declares one, else all names.
@@ -314,7 +334,7 @@ namespace ModSettingsTool.Config
                     string[] enumChoices = ChoicesOf(av) ?? EnumNames(t);
                     if (t.IsDefined(typeof(FlagsAttribute), false))
                         enumChoices = WithComboValues(entry, enumChoices);
-                    return Make(entry, section, key, desc, t, ControlKind.EnumDropdown, enumChoices);
+                    return Make(entry, ownerGuid, section, key, desc, t, ControlKind.EnumDropdown, enumChoices);
                 }
 
                 if (t == typeof(bool))
@@ -323,8 +343,8 @@ namespace ModSettingsTool.Config
                     // allowed values, so a free toggle can't stage a value BepInEx will reject.
                     string[]? boolChoices = ChoicesOf(av);
                     return boolChoices != null
-                        ? Make(entry, section, key, desc, t, ControlKind.ChoiceDropdown, boolChoices)
-                        : Make(entry, section, key, desc, t, ControlKind.Toggle, NoChoices);
+                        ? Make(entry, ownerGuid, section, key, desc, t, ControlKind.ChoiceDropdown, boolChoices)
+                        : Make(entry, ownerGuid, section, key, desc, t, ControlKind.Toggle, NoChoices);
                 }
 
                 if (IsNumeric(t))
@@ -335,28 +355,28 @@ namespace ModSettingsTool.Config
                         // RANGE, so it can reject out-of-range edits (an unranged input would let BepInEx clamp
                         // them on save while we clear the dirty state and leave the bad text on screen).
                         if (IsSliderSafe(t, mn, mx))
-                            return new ConfigBinding(entry, section, key, desc, t, ControlKind.Slider, mn, mx, NoChoices);
+                            return new ConfigBinding(entry, ownerGuid, section, key, desc, t, ControlKind.Slider, mn, mx, NoChoices);
                         ControlKind rk = IsIntegral(t) ? ControlKind.IntInput : ControlKind.FloatInput;
-                        return new ConfigBinding(entry, section, key, desc, t, rk, mn, mx, NoChoices);
+                        return new ConfigBinding(entry, ownerGuid, section, key, desc, t, rk, mn, mx, NoChoices);
                     }
                     // A numeric AcceptableValueList<T> (discrete allowed values, not a range) must be a dropdown,
                     // not a free-form input, otherwise the player can stage a value BepInEx will reject on save.
                     string[]? numChoices = ChoicesOf(av);
                     if (numChoices != null)
-                        return Make(entry, section, key, desc, t, ControlKind.ChoiceDropdown, numChoices);
+                        return Make(entry, ownerGuid, section, key, desc, t, ControlKind.ChoiceDropdown, numChoices);
                     ControlKind k = IsIntegral(t) ? ControlKind.IntInput : ControlKind.FloatInput;
-                    return Make(entry, section, key, desc, t, k, NoChoices);
+                    return Make(entry, ownerGuid, section, key, desc, t, k, NoChoices);
                 }
 
                 if (t == typeof(string))
                 {
                     string[]? choices = ChoicesOf(av);
                     return choices != null
-                        ? Make(entry, section, key, desc, t, ControlKind.ChoiceDropdown, choices)
-                        : Make(entry, section, key, desc, t, ControlKind.TextInput, NoChoices);
+                        ? Make(entry, ownerGuid, section, key, desc, t, ControlKind.ChoiceDropdown, choices)
+                        : Make(entry, ownerGuid, section, key, desc, t, ControlKind.TextInput, NoChoices);
                 }
 
-                return Make(entry, section, key, desc, t, ControlKind.Unsupported, NoChoices);
+                return Make(entry, ownerGuid, section, key, desc, t, ControlKind.Unsupported, NoChoices);
             }
             catch
             {
@@ -364,8 +384,8 @@ namespace ModSettingsTool.Config
             }
         }
 
-        private static ConfigBinding Make(ConfigEntryBase e, string s, string k, string d, Type t, ControlKind kind, string[] choices)
-            => new(e, s, k, d, t, kind, 0, 0, choices);
+        private static ConfigBinding Make(ConfigEntryBase e, string ownerGuid, string s, string k, string d, Type t, ControlKind kind, string[] choices)
+            => new(e, ownerGuid, s, k, d, t, kind, 0, 0, choices);
 
         private static string SafeSection(ConfigEntryBase e)
         {
@@ -410,7 +430,7 @@ namespace ModSettingsTool.Config
         // True for UnityEngine.KeyCode OR an interop variant of it: some IL2CPP mods surface their hotkey
         // setting as a distinct KeyCode enum type (e.g. FullName "BepInEx.Unity.IL2CPP.UnityEngine.KeyCode").
         // Matching any enum named "KeyCode" lets those render as the press-a-key keycap rather than a ~300-item
-        // enum dropdown (DF-06). Paired with the type-correct SetKey above.
+        // enum dropdown. Paired with the type-correct SetKey above.
         private static bool IsKeyCode(Type t)
         {
             if (t == typeof(UnityEngine.KeyCode)) return true;

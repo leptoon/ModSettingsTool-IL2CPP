@@ -1,4 +1,5 @@
 using TMPro;
+using ModSettingsTool.Localization;
 using UnityEngine;
 using UnityEngine.Localization.Components;
 using UnityEngine.UI;
@@ -128,7 +129,7 @@ namespace ModSettingsTool.UI
         // (never hidden), just tucked away. Same collapsible chrome as a section (Tier 3); the body holds the
         // advanced blocks (and their per-section sub-headers).
         internal static Transform MakeAdvancedContainer(TextMeshProUGUI template, Transform parent, int count, bool startExpanded, System.Action<bool>? onToggle)
-            => BuildCollapsible(template, parent, $"Advanced Settings ({count})", startExpanded, onToggle);
+            => BuildCollapsible(template, parent, I18n.T("ui.advancedSettingsCount", ("count", count.ToString())), startExpanded, onToggle);
 
         // Shared collapsible builder: a clickable header (accent bar + [-]/[+] caret + bold UPPERCASE accent
         // title) above a separate body card (returned). Clicking toggles the body's active state, flips the
@@ -279,7 +280,7 @@ namespace ModSettingsTool.UI
         // renders on top of the scrolled content and is not clipped by the viewport mask.
         private static GameObject MakeScrollHint(TextMeshProUGUI template, Transform paneRoot)
         {
-            GameObject hint = MakeLabel(template, paneRoot, "scroll down for more…", new Color(0.72f, 0.72f, 0.72f, 0.95f), 16f, false, false);
+            GameObject hint = MakeLabel(template, paneRoot, I18n.T("ui.scrollHint"), new Color(0.72f, 0.72f, 0.72f, 0.95f), 16f, false, false);
             hint.name = ScrollHintName;
 
             TextMeshProUGUI? tmp = hint.GetComponent<TextMeshProUGUI>();

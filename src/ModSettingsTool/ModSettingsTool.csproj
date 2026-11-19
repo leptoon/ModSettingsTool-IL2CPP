@@ -18,7 +18,7 @@
     <AssemblyName>ModSettingsTool</AssemblyName>
     <RootNamespace>ModSettingsTool</RootNamespace>
     <Product>Mod Settings Tool</Product>
-    <Version>0.3.0</Version>
+    <Version>0.4.3</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- CS1591: no XML doc gen. CS0436: the source nullable-attribute shim (Compat/NullableAttributesShim.cs)
          intentionally shadows Il2Cppmscorlib's broken copies. -->
@@ -27,6 +27,10 @@
     <ModSettingsToolOutputDir Condition="'$(ModSettingsToolOutputDir)' == ''">$(MSBuildThisFileDirectory)../../build</ModSettingsToolOutputDir>
     <OutputPath>$(ModSettingsToolOutputDir)</OutputPath>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Localization\LocalizationCatalog.json" LogicalName="ModSettingsTool.Localization.LocalizationCatalog.json" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- BepInEx 6 IL2CPP core (BepInEx/core/). BepInEx.Core carries the Chainloader<TPlugin> base

@@ -3,7 +3,7 @@ using UnityEngine;
 
 namespace ModSettingsTool.UI
 {
-    // Central palette for the in-game "Mods" tab's right pane (Phase 4, "cohesive, clearer"). One source of
+    // Central palette for the in-game "Mods" tab's right pane ("cohesive, clearer"). One source of
     // truth so the panes, section cards, rows, and text tiers read as a deliberate, legible set on the game's
     // dark settings window, replacing the scattered inline new Color(...) the right pane used to carry. Health
     // colours stay in HealthPalette and are surfaced through Health() so callers theme from one place.

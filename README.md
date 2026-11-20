@@ -18,13 +18,13 @@ It works with any BepInEx mod that uses the standard configuration system, so th
 
 ## Requirements
 
-- Supermarket Simulator 1.4.2
+- Supermarket Simulator 1.7.3
 - Tobey's BepInEx Pack for Supermarket Simulator
 
 ## Install
 
 1. Install Tobey's BepInEx Pack for Supermarket Simulator.
-2. Download the latest release from the [Releases](https://github.com/leptoon/ModSettingsTool-IL2CPP/releases) page.
+2. Download the latest version from [Nexus Mods](https://www.nexusmods.com/supermarketsimulator/mods/1608).
 3. Extract it into your Supermarket Simulator game folder. The mod is located at `BepInEx/plugins/ModSettingsTool/ModSettingsTool.dll`.
 4. Launch the game.
 
@@ -54,7 +54,13 @@ For the BepInEx config API the mod is built on and the in-game UI surface it hoo
 
 ## Compatibility
 
-Mod Settings Tool loads through BepInEx, so a large game update can break it until it is rebuilt. If your mods stop loading after an update, check back here for a new build. The tool works in both singleplayer and co-op; in co-op your edits are saved locally, and some mods only apply changes on the host.
+Mod Settings Tool loads through BepInEx, so a large game update can break it until it is rebuilt. If your mods stop loading after an update, check the Nexus Mods page for a new build. The tool works in both singleplayer and co-op; in co-op your edits are saved locally, and some mods only apply changes on the host.
+
+## Contributing
+
+Bug reports and pull requests are welcome. Open an [issue](https://github.com/leptoon/ModSettingsTool-IL2CPP/issues) to report a problem or suggest a change, or send a pull request against `main`.
+
+Before you send a pull request, build the mod (see Build from source) and try it in game with a few other mods installed. Keep the change small and say what you tested.
 
 ## License
 

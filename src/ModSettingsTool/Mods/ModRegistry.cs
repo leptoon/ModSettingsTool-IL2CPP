@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Unity.IL2CPP;
 using ModSettingsTool.Config;
+using ModSettingsTool.Localization;
 
 namespace ModSettingsTool.Mods
 {
@@ -73,7 +74,7 @@ namespace ModSettingsTool.Mods
                     try
                     {
                         if (info.Instance is BasePlugin bp)
-                            mod.Settings = ConfigBinding.FromConfigFile(bp.Config);
+                            mod.Settings = ConfigBinding.FromConfigFile(bp.Config, guid);
                     }
                     catch (Exception ex)
                     {
@@ -215,7 +216,7 @@ namespace ModSettingsTool.Mods
             {
                 // fall through
             }
-            return "Unloaded mod";
+            return I18n.T("ui.unloadedMod");
         }
 
         // "TestFailingMod 1.0.0" -> "TestFailingMod": drop a trailing token that looks like a version (starts

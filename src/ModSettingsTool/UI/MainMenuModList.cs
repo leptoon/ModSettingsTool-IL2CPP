@@ -1,4 +1,5 @@
 using System;
+using ModSettingsTool.Localization;
 using ModSettingsTool.Mods;
 using TMPro;
 using UnityEngine;
@@ -32,6 +33,8 @@ namespace ModSettingsTool.UI
         private const float Padding = 14f;
 
         private static GameObject? _panel;
+        private static TextMeshProUGUI? _titleLabel;
+        private static TextMeshProUGUI? _hintLabel;
         private static bool _warned;
 
         // Build once per menu entry (idempotent). Driven every frame by the Host while in the menu scene; it
@@ -42,7 +45,7 @@ namespace ModSettingsTool.UI
             {
                 if (_panel != null) return;
 
-                MainMenuManager? mgr = GameSingletons.Get<MainMenuManager>();
+                MainMenuManager? mgr = GameSingletons.MainMenu();   // shared cache; see GameSingletons
                 if (mgr == null || mgr.transform == null) return; // menu not ready yet, retry next frame
 
                 Transform menu = mgr.transform;
@@ -65,11 +68,25 @@ namespace ModSettingsTool.UI
         internal static void Invalidate()
         {
             _warned = false;
+            _titleLabel = null;
+            _hintLabel = null;
             if (_panel != null)
             {
                 try { UnityEngine.Object.Destroy(_panel); } catch { }
                 _panel = null;
             }
+        }
+
+        internal static void RefreshLocaleText()
+        {
+            try
+            {
+                if (_titleLabel != null)
+                    _titleLabel.text = I18n.T("ui.installedModsCount", ("count", ModRegistry.Cache.Count.ToString()));
+                if (_hintLabel != null)
+                    _hintLabel.text = I18n.T("ui.scrollHint");
+            }
+            catch { }
         }
 
         private static void Build(Transform menu, TextMeshProUGUI template)
@@ -135,7 +152,8 @@ namespace ModSettingsTool.UI
             scroll.scrollSensitivity = 24f;
 
             int count = ModRegistry.Cache.Count;
-            AddRow(content.transform, template, $"Installed Mods ({count})", new Color(0.92f, 0.92f, 0.92f, 1f), 22f, 30f);
+            GameObject? titleRow = AddRow(content.transform, template, I18n.T("ui.installedModsCount", ("count", count.ToString())), new Color(0.92f, 0.92f, 0.92f, 1f), 22f, 30f);
+            _titleLabel = titleRow != null ? titleRow.GetComponent<TextMeshProUGUI>() : null;
             foreach (ModInfo mod in ModRegistry.Cache)
                 AddRow(content.transform, template, RowText(mod), HealthPalette.For(mod.Health), 18f, 24f);
 
@@ -151,7 +169,7 @@ namespace ModSettingsTool.UI
             Plugin.Logger.LogInfo($"[MenuList] main-menu mod list built ({count} mods, scrollable).");
         }
 
-        private static void AddRow(Transform parent, TextMeshProUGUI template, string text, Color color, float fontSize, float height)
+        private static GameObject? AddRow(Transform parent, TextMeshProUGUI template, string text, Color color, float fontSize, float height)
         {
             try
             {
@@ -161,10 +179,12 @@ namespace ModSettingsTool.UI
                 le.minHeight = height;        // floor for a single line
                 le.preferredHeight = -1f;     // defer to the TMP's wrapped preferred height so the row extends, never overlaps
                 le.flexibleWidth = 1f;
+                return row;
             }
             catch (Exception ex)
             {
                 LogOnce($"[MenuList] row '{text}' failed: {ex.GetType().Name}: {ex.Message}");
+                return null;
             }
         }
 
@@ -204,12 +224,13 @@ namespace ModSettingsTool.UI
         // RefreshHint toggles it).
         private static GameObject MakeHint(Transform panel, TextMeshProUGUI template)
         {
-            GameObject hint = MakeLabel(panel, template, "scroll down for more…", new Color(0.72f, 0.72f, 0.72f, 0.95f), 16f);
+            GameObject hint = MakeLabel(panel, template, I18n.T("ui.scrollHint"), new Color(0.72f, 0.72f, 0.72f, 0.95f), 16f);
             hint.name = "MST ScrollHint";
 
             TextMeshProUGUI? tmp = hint.GetComponent<TextMeshProUGUI>();
             if (tmp != null)
             {
+                _hintLabel = tmp;
                 tmp.alignment = TextAlignmentOptions.Center;
                 try { tmp.fontStyle = FontStyles.Italic; } catch { }
             }

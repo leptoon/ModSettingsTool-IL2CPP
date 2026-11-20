@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using ModSettingsTool.Config;
+using ModSettingsTool.Localization;
 using ModSettingsTool.Mods;
 using ModSettingsTool.Patches;
 using TMPro;
@@ -27,6 +28,7 @@ namespace ModSettingsTool.UI
         private static bool _warned;
         private static bool _warnedOnce;
         private static bool _pendingLogged;
+        private static bool _unguardedApplyNoted;   // "edits apply immediately" said once per scene, not per keystroke
 
         // Build state (reset on Invalidate / rebuild). The templates are cloned per control; the right pane
         // is rebuilt per selection.
@@ -35,10 +37,12 @@ namespace ModSettingsTool.UI
         private static Transform? _rightContent;
         private static Transform? _leftContent;      // the mod-list pane content (for our custom wheel scrolling)
         private static Transform? _controlParent;   // where a setting's control(s) parent (its setting block); falls back to _rightContent
+        private static TextMeshProUGUI? _leftTitleLabel;
+        private static TextMeshProUGUI? _searchLabel;
         private static ModInfo? _selected;   // selected mod by INSTANCE, unloaded-failure rows share an empty GUID
         private static readonly List<ModButton> _modButtons = new();
 
-        // Key-rebind capture (press-a-key, per OQ-03), driven each frame by Tick().
+        // Key-rebind capture (press-a-key), driven each frame by Tick().
         private static ConfigBinding? _capturing;
         private static TextMeshProUGUI? _capturingLabel;
         private static KeyCode[]? _captureKeys;
@@ -103,6 +107,7 @@ namespace ModSettingsTool.UI
         internal static void Invalidate()
         {
             _warned = false;
+            _unguardedApplyNoted = false;
             _warnedOnce = false;
             _pendingLogged = false;
             _labelTemplate = null;
@@ -110,6 +115,8 @@ namespace ModSettingsTool.UI
             _rightContent = null;
             _leftContent = null;
             _controlParent = null;
+            _leftTitleLabel = null;
+            _searchLabel = null;
             _selected = null;
             _modButtons.Clear();
             _pendingDropdowns.Clear();
@@ -128,6 +135,10 @@ namespace ModSettingsTool.UI
             _capturingLabel = null;
             _builtPanel = null;
             _taskbarButton = null;
+            _settingsCache = null;
+            _buildAttempts = 0;
+            _retryUntil = 0f;
+            _windowWasOpen = false;
         }
 
         // The runtime gate (PatchGate.Enabled) just turned OFF, e.g. the player set Mod Settings Tool's own
@@ -149,17 +160,44 @@ namespace ModSettingsTool.UI
             try { if (_taskbarButton != null) _taskbarButton.SetActive(true); } catch { }
         }
 
-        // Driven from the Host (every ~0.5s in the store) and synchronously when the Settings page opens. We
-        // try to build the moment the settings structures EXIST, even while the submenu is still inactive,
-        // so the tab is already present when the player loads the save, not popped in on first open. TryBuild
-        // is idempotent (AlreadyBuilt) and no-ops until it finds a clean toggle + slider template, so an early
-        // call before the rows resolve just retries; a game build that only creates the rows on first open is
-        // covered by the synchronous set_Enable(true) hook in MenuPatches.
+        // Cheap "has the tab been injected in this scene yet?" probe (a field read, no Unity object scan), so
+        // the Host's degraded-mode build fallback can stop polling the moment it succeeds. Invalidate() clears
+        // _builtPanel on every scene change, so this correctly reads false again in each new scene.
+        internal static bool IsBuilt => _builtPanel != null;
+
+        internal static void RefreshLocaleText()
+        {
+            try
+            {
+                if (_taskbarButton != null)
+                {
+                    TextMeshProUGUI? label = _taskbarButton.GetComponentInChildren<TextMeshProUGUI>(true);
+                    if (label != null) label.text = I18n.T("ui.tab.mods");
+                }
+
+                if (_leftTitleLabel != null)
+                    _leftTitleLabel.text = I18n.T("ui.installedModsCount", ("count", ModRegistry.Cache.Count.ToString()));
+                if (_searchLabel != null)
+                    _searchLabel.text = I18n.T("ui.search");
+
+                if (_selected != null) RebuildCurrentPage();
+                else ShowRightMessage(I18n.T("ui.selectModPrompt"));
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger.LogWarning($"[ModsTab] locale refresh failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // Called by menu/settings hooks. TryBuild is idempotent (AlreadyBuilt) and no-ops until it finds a
+        // clean settings surface, so a game build that only creates rows on first open is covered by the
+        // synchronous set_Enable(true) hook in SettingsOpenPatch, backed by the short post-open retry window
+        // below.
         internal static void Poll()
         {
             try
             {
-                SettingsMenuManager? sm = FindSettingsManager();
+                SettingsMenuManager? sm = ResolveSettings();
                 if (sm == null || sm.gameObject == null) return;
                 TryBuild(sm);
             }
@@ -167,6 +205,173 @@ namespace ModSettingsTool.UI
             {
                 // fail-soft; the main-menu list does not depend on this
             }
+        }
+
+        // ── bounded build retry ───────────────────────────────────────────────────────────────────────
+        // Per-scene state; Invalidate() resets every field in this block.
+        private static SettingsMenuManager? _settingsCache;
+        private static int _buildAttempts;
+        private static float _retryUntil;
+        private static bool _windowWasOpen;
+
+        // A retry is cheap by construction: ResolveSettings caches the manager per scene (shared with the mod
+        // list, so at most ONE scan between them and none once resolved), and a failing TryBuild checks the
+        // taskbar surface and row templates before any global scan or page population. The attempt cap is a
+        // hard backstop so NO path can retry forever, however the surface fails.
+        private const int MaxBuildAttempts = 60;
+        private const float OpenRetrySeconds = 3f;
+
+        // "A settings window just opened." The single definition of that event, called by the open hooks and,
+        // when they are dead, by ObserveOpenState on the closed -> open edge. Everything a fresh open implies
+        // lives here, so the hooked and hookless paths cannot drift apart:
+        //
+        //   * Retry window. The game may not have populated the settings rows at the instant set_Enable(true)
+        //     fires, 1.5.0's WindowTab.willWaitInitialize makes deferred tab init a live case, and TryBuild
+        //     correctly bails on that. Without a retry the tab would stay missing until the player closed and
+        //     REOPENED Settings; this gives the Host a short window to try again within the current open.
+        //   * Budget refund. The cap bounds attempts against ONE unchanging surface; a new open is a new
+        //     surface state and earns a full budget. Deriving the refund from an observed close instead would
+        //     miss it whenever we were not observing, which, in the healthy case, is most of the time.
+        internal static void ArmOpenRetry()
+        {
+            _retryUntil = Time.unscaledTime + OpenRetrySeconds;
+            _buildAttempts = 0;
+        }
+
+        // Should the Host tick the retry this frame? Deliberately does NOT consult the attempt cap: this runs
+        // every frame (before the Host's throttle), so it must stay to cheap flag reads, and, more
+        // importantly, gating it on the cap made the cap TERMINAL. This gate is what admits ObserveOpenState,
+        // and ObserveOpenState is what refunds the budget, so refusing to run once the budget was spent froze
+        // the very state that would have cleared it: a later Settings reopen could never recover, and with the
+        // hooks dead nothing else could inject the tab. The cap sits inside PollRetry instead, downstream of
+        // the observation that can lift it.
+        internal static bool WantsBuildRetry(bool hooksActive)
+        {
+            if (IsBuilt) return false;
+            return !hooksActive || RetryWindowArmed;
+        }
+
+        // A Settings-open retry window is currently open. The Host polls fast inside it and slowly outside,
+        // so idle degraded-mode probing stays cheap.
+        internal static bool RetryWindowArmed => Time.unscaledTime < _retryUntil;
+
+        // The Host's throttled retry tick, the expensive half of the fallback. It only ever SPENDS budget;
+        // the refund belongs to ArmOpenRetry, reached per-frame via ObserveOpenState's open edge:
+        //
+        //   1. Not ready -> return uncharged. A closed or unpopulated window costs only child counts, so
+        //      waiting is free and the budget survives until there is something to build.
+        //   2. Capped for THIS open -> return without scanning. A populated surface we cannot use (a game
+        //      update reshaping the rows) stops burning component searches; the next open refunds.
+        //
+        // So the cap bounds real work against one unchanging surface, and can never become a dead end.
+        internal static void PollRetry()
+        {
+            try
+            {
+                SettingsMenuManager? sm = ResolveSettings();
+                if (sm == null || sm.gameObject == null) return;
+                if (!SurfaceReady(sm)) return;
+                if (_buildAttempts >= MaxBuildAttempts) return;
+
+                _buildAttempts++;
+                TryBuild(sm);
+            }
+            catch
+            {
+                // fail-soft; the main-menu list does not depend on this
+            }
+        }
+
+        // Is the settings window OPEN and built out enough to clone from? A liveness flag, a transform lookup
+        // and child counts only, no component searches, so it is safe on every throttled tick, capped or not.
+        //
+        // The activeInHierarchy test is load-bearing, not defensive. The game closes the settings window by
+        // DEACTIVATING an ancestor: in the shipped main-menu scene the window's `Menu` node is serialized
+        // inactive while the `Tabs`/`Gameplay Tab` hierarchy beneath it stays active and fully populated. So
+        // Transform.Find and childCount, which both work on inactive objects, report a perfectly usable
+        // surface while Settings is shut. Without this flag a closed window would be charged as a real build
+        // attempt and drain the budget before the player ever opened Settings. (ObserveOpenState reads the
+        // same flag for the cheaper open/closed EDGE that refunds the budget.)
+        private static bool SurfaceReady(SettingsMenuManager settings)
+        {
+            try
+            {
+                TabManager? tabs = settings.m_tabManager;
+                if (tabs == null || tabs.transform == null) return false;
+                if (!tabs.gameObject.activeInHierarchy) return false;   // Settings is closed
+                if (!TaskbarReady(tabs)) return false;
+                return AnyTabPopulated(tabs.m_Tabs);
+            }
+            catch { return false; }
+        }
+
+        // Resolve the settings manager, caching it for the scene. FindSettingsManager does a FindObjectOfType
+        // in the menu scene, so a repeating retry must not call it every tick. Unity's overloaded == makes a
+        // destroyed object compare null, so a stale cache entry re-resolves instead of going dead.
+        //
+        // Resolve the settings manager, caching it for the scene. Unity's overloaded == makes a destroyed
+        // object compare null, so a stale cache entry re-resolves instead of going dead.
+        //
+        // NO retry backoff here, deliberately, and this reverses an earlier backoff with three rounds of
+        // evidence behind it. The backoff answered a fair observation (a failed lookup re-scanned on every degraded
+        // tick), but every backoff shaped to bound that scan also BLINDED us, because the resolve is the only
+        // way to discover that Settings opened: ObserveOpenState needs _settingsCache, ArmOpenRetry is the
+        // only thing that clears a deadline, and without the hooks ArmOpenRetry is reachable only through
+        // ObserveOpenState. That cycle produced a defect in three consecutive review rounds, a lazily created
+        // settings window invisible until the deadline expired, then a manager that appeared after the first
+        // failed scan, then the same delay again whenever the main-menu list is switched off and nothing else
+        // populates the shared cache.
+        //
+        // What actually bounds the scan is the Host's poll throttle, which was always there: PollRetry runs at
+        // most every DegradedPollInterval (2s), and only while the tab is unbuilt in degraded mode. So the
+        // worst case is one FindObjectOfType<MainMenuManager> every two seconds, on the main menu, until it
+        // resolves, against a per-frame scan of that exact type that MainMenuModList.EnsureBuilt already
+        // performs whenever the list is enabled and unbuilt. Trading a 0.5 Hz scan for a tab that can miss a
+        // short Settings open was the wrong trade.
+        private static SettingsMenuManager? ResolveSettings()
+        {
+            SettingsMenuManager? sm = _settingsCache;
+            if (sm != null && sm.gameObject != null) return sm;
+            sm = FindSettingsManager();
+            _settingsCache = sm;
+            return sm;
+        }
+
+        // Per-frame, cache-only: did the settings window just OPEN? Costs a handful of field reads and no
+        // lookup of any kind (a null cache simply waits for the throttled tick to resolve it), so it is safe
+        // outside the Host's throttle, and it has to be, for two reasons the throttled path cannot serve:
+        //
+        //   * The closed -> open edge is what refunds the attempt budget. Sampled only every
+        //     DegradedPollInterval, an open-and-close inside one interval is invisible, and a scene that had
+        //     already spent its budget could never earn it back.
+        //   * In degraded mode NOTHING calls ArmOpenRetry, the hooks that would are the ones that failed,
+        //     so the fallback would poll at its slow idle rate at the one moment it matters, and the tab
+        //     would visibly pop in seconds after the player opened Settings. Arming here on the edge gives
+        //     the hookless path the same fast window the hooked path gets.
+        // Returns TRUE only on the frame a fresh open is detected, so the Host can pull in its throttle: the
+        // first tick of a degraded open resolves the manager and schedules the NEXT attempt at the slow idle
+        // interval, and only the frame after that can this see the now-cached open window and arm. Without
+        // that signal the fast window would be armed while a slow deadline was already booked, so the tab
+        // could sit missing for the whole idle interval, or miss a short open entirely.
+        internal static bool ObserveOpenState()
+        {
+            try
+            {
+                SettingsMenuManager? sm = _settingsCache;
+                // Nothing resolved (yet), or the manager was destroyed under us: the window cannot be open,
+                // so clear the edge state. Otherwise a manager destroyed WHILE its window was open would
+                // leave this latched true and swallow the next real open's refund.
+                if (sm == null || sm.gameObject == null) { _windowWasOpen = false; return false; }
+                TabManager? tabs = sm.m_tabManager;
+                if (tabs == null) { _windowWasOpen = false; return false; }
+
+                bool open = tabs.gameObject.activeInHierarchy;
+                bool armed = open && !_windowWasOpen;
+                if (armed) ArmOpenRetry();   // the hookless equivalent of the open hooks
+                _windowWasOpen = open;
+                return armed;
+            }
+            catch { return false; }
         }
 
         // The Settings window hosting our tab differs by scene but is the SAME SettingsMenuManager type either
@@ -178,14 +383,21 @@ namespace ModSettingsTool.UI
             {
                 if (PatchGate.InStore())
                 {
+                    // Static singleton accessor, never a scan.
                     if (!EscapeMenuManager.HasInstance) return null;
                     EscapeMenuManager menu = EscapeMenuManager.Instance;
                     return menu != null ? menu.settingsMenu : null;
                 }
                 if (PatchGate.InMenu())
                 {
-                    MainMenuManager? mm = GameSingletons.Get<MainMenuManager>();
-                    return mm != null ? mm.m_SettingsMenu : null;
+                    // Shared with MainMenuModList: whichever feature resolves the manager first, both get it,
+                    // and once it is cached neither scans again. The mod list is optional ([Main Menu] Show
+                    // Mod List), so this must not DEPEND on it having run, it only benefits when it has.
+                    MainMenuManager? mm = GameSingletons.MainMenu();
+                    if (mm == null) return null;
+                    // A free field read, deliberately: the game may not create the settings window until the
+                    // player first opens it, and that lazily created object must be picked up on the next tick.
+                    return mm.m_SettingsMenu;
                 }
             }
             catch { }
@@ -249,6 +461,13 @@ namespace ModSettingsTool.UI
             return true;
         }
 
+        // Build the tab if the surface allows it; idempotent, and silently no-ops on a surface that is not
+        // ready. Deliberately returns nothing: it once returned "was this a substantive attempt?" for
+        // PollRetry to decide whether to charge the retry budget, but that decision moved to SurfaceReady,
+        // which PollRetry must consult anyway, since a closed window has to stay uncharged, and the result
+        // went unread by both callers. The cheap bails below are now purely defensive re-checks (PollRetry
+        // has already established all of them), so there is no longer a caller-visible distinction to
+        // report. The charging rule lives in exactly one place: PollRetry.
         private static void TryBuild(SettingsMenuManager settings)
         {
             try
@@ -257,12 +476,20 @@ namespace ModSettingsTool.UI
                 TabManager? tabs = settings.m_tabManager;
                 if (tabs == null || tabs.transform == null) return;
                 if (AlreadyBuilt(tabs)) return;
+                if (!TaskbarReady(tabs)) return;
+
+                Il2CppReferenceArray<WindowTab>? tabArr = tabs.m_Tabs;
+
+                // Cheap gate before the component-tree search below: if no tab has any content rows yet, the
+                // window has not populated (Settings never opened, or the game defers it). Bail on child
+                // counts alone, before any component search. (Reached only via the hook-driven Poll(); the
+                // retry path establishes this in SurfaceReady before it charges.)
+                if (!AnyTabPopulated(tabArr)) return;
 
                 // Pick clone templates from a tab's CONTENT ROWS (direct children), not by name and not via
                 // a blind GetComponentInChildren, the latter finds a dropdown's hidden item-template Toggle.
                 WindowTab? source = null;
                 GameObject? refToggle = null, refSlider = null, refDropdown = null, refInput = null;
-                Il2CppReferenceArray<WindowTab>? tabArr = tabs.m_Tabs;
                 if (tabArr != null)
                 {
                     for (int i = 0; i < tabArr.Length; i++)
@@ -279,15 +506,17 @@ namespace ModSettingsTool.UI
                         if (refInput == null) refInput = FindInputTemplate(t);
                     }
                 }
-                if (refInput == null) refInput = FindAnyInputField(); // settings tabs have none, clone any loaded field
                 if (source == null || refToggle == null || refSlider == null)
                 {
-                    // Transient, not a failure: the settings window's tab rows aren't populated yet on this open.
-                    // The Host poll + the EscapeMenu OnEnable nudge re-run this until they are, so it's a retry.
+                    // The window IS populated but carries no row we can clone. Usually transient (rows still
+                    // materialising as the page opens) and the next retry picks them up; if instead a game
+                    // update has reshaped the rows for good, this never resolves, so it counts as a real
+                    // attempt, letting the cap retire the retry rather than rescanning the tree forever.
                     // Trace once per scene at Debug so it never surfaces as a warning in a release log.
-                    if (!_pendingLogged) { _pendingLogged = true; Plugin.Logger.LogDebug("[ModsTab] settings tab rows not ready yet; the Mods tab will inject on a later open."); }
+                    if (!_pendingLogged) { _pendingLogged = true; Plugin.Logger.LogDebug("[ModsTab] settings tab rows not usable yet; the Mods tab will inject on a later open."); }
                     return;
                 }
+                if (refInput == null) refInput = FindAnyInputField(); // settings tabs have none, clone any loaded field
 
                 GameObject panel = UnityEngine.Object.Instantiate(source.gameObject, source.transform.parent, false);
                 panel.name = "Mod Settings Tool Tab";
@@ -309,20 +538,19 @@ namespace ModSettingsTool.UI
                 // "save"/"back" (e.g. a mod called "BetterSave") that could otherwise steal the wiring.
                 HookWindowButtons(panel);
 
-                Plugin.Logger.LogDebug($"[ModsTab] building two-pane, templates toggle:{refToggle != null} slider:{refSlider != null} dropdown:{refDropdown != null} input:{refInput != null}; mods:{ModRegistry.Cache.Count}.");
-
-                PopulateMods(content, refToggle!, refSlider!, refDropdown, refInput);
-
                 // Build the taskbar button BEFORE committing the tab. If the taskbar isn't ready yet, this
-                // returns null, treat that as an incomplete build: destroy the clone and return WITHOUT
-                // appending, so AlreadyBuilt stays false and a later poll retries. Otherwise the WindowTab
-                // would be appended (AlreadyBuilt → true) with no button to open it, hidden forever.
+                // returns null, treat that as an incomplete build before doing the expensive page population.
                 GameObject? taskbarButton = AddTaskbarButton(tabs, windowTab);
                 if (taskbarButton == null)
                 {
                     try { UnityEngine.Object.Destroy(panel); } catch { }
                     return;
                 }
+
+                Plugin.Logger.LogDebug($"[ModsTab] building two-pane, templates toggle:{refToggle != null} slider:{refSlider != null} dropdown:{refDropdown != null} input:{refInput != null}; mods:{ModRegistry.Cache.Count}.");
+
+                PopulateMods(content, refToggle!, refSlider!, refDropdown, refInput);
+
                 AppendTab(tabs, windowTab);
                 _builtPanel = panel;
                 _taskbarButton = taskbarButton;
@@ -335,6 +563,8 @@ namespace ModSettingsTool.UI
                     _warned = true;
                     Plugin.Logger.LogWarning($"[ModsTab] could not build the tab (the main-menu list still works): {ex.GetType().Name}: {ex.Message}");
                 }
+                // Nothing to report: PollRetry already charged this attempt, so a surface that fails this
+                // way cannot retry forever.
             }
         }
 
@@ -383,11 +613,12 @@ namespace ModSettingsTool.UI
                 BuildSearchField(searchHost.transform);
                 Plugin.Logger.LogDebug("[ModsTab] two-pane scaffold built; populating the mod list.");
 
-                UiBuild.MakeLabel(template, leftContent, $"Installed Mods ({ModRegistry.Cache.Count})", UiTheme.TitleText, 20f, false, false);
+                GameObject leftTitle = UiBuild.MakeLabel(template, leftContent, I18n.T("ui.installedModsCount", ("count", ModRegistry.Cache.Count.ToString())), UiTheme.TitleText, 20f, false, false);
+                _leftTitleLabel = leftTitle.GetComponent<TextMeshProUGUI>();
                 foreach (ModInfo mod in ModRegistry.Cache) AddModButton(leftContent, mod);
                 UiBuild.ResetScrollAndRefreshHint(leftContent); // left list is static after this, top + evaluate its hint
 
-                ShowRightMessage("Select a mod on the left to view its settings.");
+                ShowRightMessage(I18n.T("ui.selectModPrompt"));
             }
             catch (Exception ex)
             {
@@ -487,7 +718,7 @@ namespace ModSettingsTool.UI
                 List<ConfigBinding> visible = filtering ? FilterSettings(mod.Settings, _filter) : mod.Settings;
                 if (filtering && visible.Count == 0)
                 {
-                    UiBuild.MakeLabel(_labelTemplate, _rightContent, $"No settings match \"{_filter}\".", UiTheme.DimText, 16f, true, false);
+                    UiBuild.MakeLabel(_labelTemplate, _rightContent, I18n.T("ui.noSettingsMatch", ("query", _filter)), UiTheme.DimText, 16f, true, false);
                     return;
                 }
 
@@ -502,7 +733,7 @@ namespace ModSettingsTool.UI
                     if (IsDebugSection(g.Section)) continue;
                     if (g.Normal.Count == 0) continue;
                     string sectionKey = g.Section ?? "";
-                    string title = string.IsNullOrEmpty(sectionKey) ? "General" : sectionKey;
+                    string title = g.DisplaySection;
                     RenderCollapsibleSection(sectionKey, title, g.Normal, filtering);
                 }
 
@@ -524,7 +755,7 @@ namespace ModSettingsTool.UI
                     {
                         if (IsDebugSection(g.Section)) continue;
                         if (g.Advanced.Count == 0) continue;
-                        if (!string.IsNullOrEmpty(g.Section)) UiBuild.MakeSubHeader(_labelTemplate, advBody, g.Section);
+                        if (!string.IsNullOrEmpty(g.Section)) UiBuild.MakeSubHeader(_labelTemplate, advBody, g.DisplaySection);
                         foreach (ConfigBinding b in g.Advanced) AddSetting(b, advBody);
                     }
                 }
@@ -538,7 +769,7 @@ namespace ModSettingsTool.UI
                     all.AddRange(g.Advanced);
                     if (all.Count == 0) continue;
                     string sectionKey = g.Section ?? "";
-                    RenderCollapsibleSection(sectionKey, sectionKey, all, filtering);
+                    RenderCollapsibleSection(sectionKey, g.DisplaySection, all, filtering);
                 }
             }
             finally
@@ -550,9 +781,9 @@ namespace ModSettingsTool.UI
         }
 
         // A one-line co-op advisory pinned to the top of every Mods-tab page while in the co-op store. The tab
-        // works exactly as in singleplayer: edits write to each mod's live ConfigEntry and BepInEx saves them
+        // works exactly as in singleplayer, edits write to each mod's live ConfigEntry and BepInEx saves them
         // locally, but a mod may only ACT on a changed value on the host (the authoritative session), so the
-        // notice sets expectations. Informational ONLY: nothing is blocked or hidden.
+        // notice sets expectations. Informational ONLY: nothing is blocked or hidden (maintainer decision 2026-06-19).
         private static void AddCoopNotice()
         {
             try
@@ -560,7 +791,7 @@ namespace ModSettingsTool.UI
                 if (_rightContent == null || _labelTemplate == null) return;
                 Color bg = UiTheme.Accent; bg.a = 0.16f;
                 UiBuild.MakeBanner(_labelTemplate, _rightContent,
-                    "Co-op session: settings save locally. Some mods only apply changes on the host, so a change may not take effect for everyone.",
+                    I18n.T("ui.coopNotice"),
                     UiTheme.Accent, bg);
             }
             catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] co-op notice failed: {ex.GetType().Name}: {ex.Message}"); }
@@ -601,6 +832,7 @@ namespace ModSettingsTool.UI
         private sealed class SectionGroup
         {
             public readonly string Section;
+            public string DisplaySection = "";
             public readonly List<ConfigBinding> Normal = new();
             public readonly List<ConfigBinding> Advanced = new();
             public SectionGroup(string section) { Section = section; }
@@ -631,6 +863,7 @@ namespace ModSettingsTool.UI
                 {
                     string sec = b.Section ?? "";
                     if (!index.TryGetValue(sec, out SectionGroup? g)) { g = new SectionGroup(sec); groups.Add(g); index[sec] = g; }
+                    if (string.IsNullOrEmpty(g.DisplaySection)) g.DisplaySection = b.DisplaySection;
                     if (b.IsAdvanced) g.Advanced.Add(b); else g.Normal.Add(b);
                 }
 
@@ -646,6 +879,7 @@ namespace ModSettingsTool.UI
                 if (groups.Count == 0)
                 {
                     var g = new SectionGroup("");
+                    g.DisplaySection = I18n.T("ui.generalSection");
                     g.Normal.AddRange(settings);
                     groups.Add(g);
                 }
@@ -680,8 +914,8 @@ namespace ModSettingsTool.UI
                 UiBuild.MakeBanner(_labelTemplate!, card, mod.IssueSummary, UiTheme.Health(mod.Health), UiTheme.HealthBanner(mod.Health));
 
             string count = mod.HasSettings
-                ? $"{mod.Settings.Count} setting{(mod.Settings.Count == 1 ? "" : "s")}"
-                : "No settings to change.";
+                ? I18n.T("ui.settingsCount", ("count", mod.Settings.Count.ToString()))
+                : I18n.T("ui.noSettings");
             UiBuild.MakeLabel(_labelTemplate!, card, count, UiTheme.DimText, 15f, true, false);
 
             // Page-level "Reset all to defaults" (staged like any edit; Discard reverts, Save persists). Only
@@ -707,7 +941,7 @@ namespace ModSettingsTool.UI
                 if (img != null) { img.color = new Color(0.55f, 0.33f, 0.30f, 0.55f); img.raycastTarget = true; }
                 Button btn = box.AddComponent<Button>();
 
-                GameObject lbl = UiBuild.MakeLabel(_labelTemplate!, box.transform, "Reset all to defaults", UiTheme.LabelText, 14f, false, false);
+                GameObject lbl = UiBuild.MakeLabel(_labelTemplate!, box.transform, I18n.T("ui.resetAll"), UiTheme.LabelText, 14f, false, false);
                 RectTransform lrt = lbl.GetComponent<RectTransform>();
                 if (lrt != null) { lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.offsetMin = Vector2.zero; lrt.offsetMax = Vector2.zero; }
                 TextMeshProUGUI? lt = lbl.GetComponent<TextMeshProUGUI>();
@@ -759,8 +993,8 @@ namespace ModSettingsTool.UI
                 AddControl(b);
                 if (b.ReadOnly) DisableInteractables(block);
                 AddMetaLine(b, block, row);
-                if (ShowDescriptionsEnabled() && !string.IsNullOrEmpty(b.Description))
-                    UiBuild.MakeDescription(_labelTemplate!, block, b.Description);
+                if (ShowDescriptionsEnabled() && !string.IsNullOrEmpty(b.DisplayDescription))
+                    UiBuild.MakeDescription(_labelTemplate!, block, b.DisplayDescription);
                 UpdateMarker(b); // initial dot/reset state (a row may already differ from default)
             }
             finally
@@ -799,7 +1033,7 @@ namespace ModSettingsTool.UI
                 Image rimg = rst.AddComponent<Image>();
                 if (rimg != null) { rimg.color = new Color(1f, 1f, 1f, 0.10f); rimg.raycastTarget = true; }
                 Button rbtn = rst.AddComponent<Button>();
-                GameObject rlbl = UiBuild.MakeLabel(_labelTemplate!, rst.transform, "Reset", UiTheme.LabelText, 12f, false, false);
+                GameObject rlbl = UiBuild.MakeLabel(_labelTemplate!, rst.transform, I18n.T("ui.reset"), UiTheme.LabelText, 12f, false, false);
                 RectTransform rlrt = rlbl.GetComponent<RectTransform>();
                 if (rlrt != null) { rlrt.anchorMin = Vector2.zero; rlrt.anchorMax = Vector2.one; rlrt.offsetMin = Vector2.zero; rlrt.offsetMax = Vector2.zero; }
                 TextMeshProUGUI? rlt = rlbl.GetComponent<TextMeshProUGUI>();
@@ -815,16 +1049,18 @@ namespace ModSettingsTool.UI
         private static string MetaText(ConfigBinding b)
         {
             string def = b.Default != null ? Stringify(b.Default) : "-";
-            string s = "default: " + def;
+            var parts = new List<string> { I18n.T("ui.defaultValue", ("value", def)) };
             try
             {
                 if (b.Kind == ControlKind.Slider || ((b.Kind == ControlKind.IntInput || b.Kind == ControlKind.FloatInput) && b.HasRange))
-                    s += "      range " + TrimNum(b.Min) + "–" + TrimNum(b.Max);
+                    parts.Add(I18n.T("ui.range", ("min", TrimNum(b.Min)), ("max", TrimNum(b.Max))));
                 else if ((b.Kind == ControlKind.EnumDropdown || b.Kind == ControlKind.ChoiceDropdown) && b.Choices != null && b.Choices.Length > 0)
-                    s += b.Choices.Length <= 6 ? "      options: " + string.Join(" / ", b.Choices) : "      " + b.Choices.Length + " options";
+                    parts.Add(b.Choices.Length <= 6
+                        ? I18n.T("ui.optionsList", ("options", string.Join(" / ", b.ChoiceLabels)))
+                        : I18n.T("ui.optionsCount", ("count", b.Choices.Length.ToString())));
             }
             catch { }
-            return s;
+            return string.Join("      ", parts);
         }
 
         private static string Stringify(object o)
@@ -948,7 +1184,8 @@ namespace ModSettingsTool.UI
             try
             {
                 var opts = new Il2CppSystem.Collections.Generic.List<string>();
-                foreach (string c in b.Choices) opts.Add(c);
+                string[] labels = b.ChoiceLabels;
+                foreach (string c in labels) opts.Add(c);
                 dd.ClearOptions();
                 dd.AddOptions(opts);
                 dd.SetValueWithoutNotify(EffectiveChoiceIndex(b)); // staged pick survives a search rebuild
@@ -973,13 +1210,14 @@ namespace ModSettingsTool.UI
             try
             {
                 var opts = dd.options;
-                if (opts == null || opts.Count != b.Choices.Length) return false;
+                string[] labels = b.ChoiceLabels;
+                if (opts == null || opts.Count != labels.Length) return false;
                 // Every option must match, a stale NON-selected label (template still holding "Medium" instead
                 // of "High") would otherwise let the player pick a value that maps to the wrong setting index.
-                for (int i = 0; i < b.Choices.Length; i++)
+                for (int i = 0; i < labels.Length; i++)
                 {
                     var od = opts[i];
-                    if (od == null || !string.Equals(od.text, b.Choices[i], StringComparison.Ordinal)) return false;
+                    if (od == null || !string.Equals(od.text, labels[i], StringComparison.Ordinal)) return false;
                 }
                 return true;
             }
@@ -1026,7 +1264,7 @@ namespace ModSettingsTool.UI
                     _capturing = b;
                     _capturingLabel = capTmp;
                     _capturePrevText = capTmp != null ? capTmp.text : "";
-                    if (capTmp != null) capTmp.text = "Press a key…";
+                    if (capTmp != null) capTmp.text = I18n.T("ui.pressKey");
                 });
 
                 // A small "Clear" button so KeyCode.None (the disabled/unbound value many mods use) is reachable,
@@ -1037,7 +1275,7 @@ namespace ModSettingsTool.UI
                 Image xbg = clr.AddComponent<Image>();
                 if (xbg != null) { xbg.color = new Color(1f, 1f, 1f, 0.10f); xbg.raycastTarget = true; }
                 Button xbtn = clr.AddComponent<Button>();
-                GameObject xlbl = UiBuild.MakeLabel(_labelTemplate!, clr.transform, "Clear", new Color(0.82f, 0.82f, 0.86f, 1f), 12f, false, false);
+                GameObject xlbl = UiBuild.MakeLabel(_labelTemplate!, clr.transform, I18n.T("ui.clear"), new Color(0.82f, 0.82f, 0.86f, 1f), 12f, false, false);
                 RectTransform xlrt = xlbl.GetComponent<RectTransform>();
                 if (xlrt != null) { xlrt.anchorMin = Vector2.zero; xlrt.anchorMax = Vector2.one; xlrt.offsetMin = Vector2.zero; xlrt.offsetMax = Vector2.zero; }
                 TextMeshProUGUI? xtmp = xlbl.GetComponent<TextMeshProUGUI>();
@@ -1046,7 +1284,7 @@ namespace ModSettingsTool.UI
                 {
                     if (_capturing != null) EndCapture(); // cancel/restore any active capture, this row OR another
                     StageOrClear(b, KeyCode.None.ToString() != (b.Value?.ToString() ?? ""), KeyCode.None, () => b.SetKey(KeyCode.None));
-                    try { if (capTmp != null) capTmp.text = KeyCode.None.ToString(); } catch { }
+                    try { if (capTmp != null) capTmp.text = KeyName(KeyCode.None); } catch { }
                 });
             }
             catch (Exception ex)
@@ -1059,7 +1297,7 @@ namespace ModSettingsTool.UI
         private static void AddReadOnly(ConfigBinding b)
         {
             string val = b.Value?.ToString() ?? "";
-            UiBuild.MakeLabel(_labelTemplate!, _controlParent!, $"{b.DisplayName}: {val}  (read-only)", UiTheme.FaintText, 15f, true, false);
+            UiBuild.MakeLabel(_labelTemplate!, _controlParent!, I18n.T("ui.readOnlyValue", ("label", b.DisplayName), ("value", val), ("state", I18n.T("ui.readOnlySuffix"))), UiTheme.FaintText, 15f, true, false);
         }
 
         // IntInput / FloatInput / TextInput: a left label + a right TMP_InputField. CLONE a real loaded field
@@ -1156,7 +1394,7 @@ namespace ModSettingsTool.UI
                 try { input.placeholder = null; } catch { }
 
                 // Drop any serialized onValueChanged / onEndEdit the arbitrary clone source carried, by replacing
-                // the whole event object (MST-RULE-12). AddClonedInput re-adds our staged handlers afterward; a
+                // the whole event object. AddClonedInput re-adds our staged handlers afterward; a
                 // numeric input adds NO onValueChanged, so without this its template's persistent listener (a real
                 // game/mod action) would fire on every keystroke.
                 try { input.onValueChanged = new TMP_InputField.OnChangeEvent(); } catch { }
@@ -1179,7 +1417,7 @@ namespace ModSettingsTool.UI
                 }
 
                 // Neutralize any cloned sub-controls (e.g. a stepper's +/- buttons) so a stray click can't drive
-                // the source field's serialized action (MST-RULE-12). The input itself stays interactable.
+                // the source field's serialized action. The input itself stays interactable.
                 foreach (Selectable s in inGo.GetComponentsInChildren<Selectable>(true))
                 {
                     if (s == null) continue;
@@ -1436,7 +1674,7 @@ namespace ModSettingsTool.UI
                 Outline so = swGo.AddComponent<Outline>();
                 if (so != null) { so.effectColor = new Color(0f, 0f, 0f, 0.55f); so.effectDistance = new Vector2(1f, -1f); }
 
-                GameObject hintGo = UiBuild.MakeLabel(_labelTemplate!, head.transform, "( click to edit )", new Color(0.16f, 0.16f, 0.22f, 0.92f), 14f, false, false);
+                GameObject hintGo = UiBuild.MakeLabel(_labelTemplate!, head.transform, I18n.T("ui.colorEdit"), new Color(0.16f, 0.16f, 0.22f, 0.92f), 14f, false, false);
                 RectTransform hrt = hintGo.GetComponent<RectTransform>();
                 if (hrt != null) { hrt.anchorMin = new Vector2(0f, 0f); hrt.anchorMax = new Vector2(1f, 1f); hrt.offsetMin = new Vector2(0f, 0f); hrt.offsetMax = new Vector2(-90f, 0f); } // centred, clear of the swatch
                 TextMeshProUGUI? hintTmp = hintGo.GetComponent<TextMeshProUGUI>();
@@ -1465,7 +1703,7 @@ namespace ModSettingsTool.UI
                 {
                     bool show = !container.gameObject.activeSelf;
                     container.gameObject.SetActive(show);
-                    if (hintTmp != null) hintTmp.text = show ? "( click to collapse )" : "( click to edit )";
+                    if (hintTmp != null) hintTmp.text = show ? I18n.T("ui.colorCollapse") : I18n.T("ui.colorEdit");
                     UiBuild.RefreshScrollHint(_rightContent);
                 });
 
@@ -1527,7 +1765,7 @@ namespace ModSettingsTool.UI
             try
             {
                 const float hexW = 200f;
-                GameObject row = CloneControlRow("Hex", hexW, out _); // game row chrome + title, matching the other rows
+                GameObject row = CloneControlRow(I18n.T("ui.hex"), hexW, out _); // game row chrome + title, matching the other rows
 
                 GameObject inGo = UnityEngine.Object.Instantiate(_refInput, row.transform, false);
                 inGo.name = "Hex Input";
@@ -1716,7 +1954,7 @@ namespace ModSettingsTool.UI
         // Clone a real settings row (the toggle template) so our CUSTOM controls (keybind, text/number input,
         // colour editor) reuse the GAME's row chrome, the blue panel + bold dark title, and read IDENTICALLY to
         // the cloned toggle/slider/dropdown rows (the smoke report: keybind + input rows were formatted differently
-        // from the others). The cloned toggle's checkbox is neutralized + hidden (MST-RULE-12: replace its event
+        // from the others). The cloned toggle's checkbox is neutralized + hidden (replace its event
         // first) leaving the right side free for the caller's control; the title is set, kept in the game's style,
         // and re-anchored to reserve `rightReserve` px on the right. Falls back to a plain scratch row if there is
         // no toggle template (then the title uses our light theme colour, legible on the fallback's neutral bg).
@@ -1746,7 +1984,7 @@ namespace ModSettingsTool.UI
                     foreach (Toggle tog in go.GetComponentsInChildren<Toggle>(true))
                     {
                         if (tog == null) continue;
-                        try { tog.onValueChanged = new Toggle.ToggleEvent(); } catch { } // MST-RULE-12: drop the serialized game action
+                        try { tog.onValueChanged = new Toggle.ToggleEvent(); } catch { } // drop the serialized game action
                         try { tog.interactable = false; tog.enabled = false; } catch { }
                         try { if (tog.graphic != null) tog.graphic.enabled = false; } catch { }                                    // checkmark
                         try { if (tog.targetGraphic != null && tog.targetGraphic.gameObject != go) tog.targetGraphic.enabled = false; } catch { } // checkbox box (never the row bg)
@@ -1777,11 +2015,12 @@ namespace ModSettingsTool.UI
             {
                 // The "Search" label sits on the light settings strip, so it is near-black (the smoke report: the
                 // old faint-grey label was almost invisible there) and bold for legibility.
-                GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, host, "Search", new Color(0.06f, 0.06f, 0.09f, 1f), 16f, false, false);
+                GameObject lblGo = UiBuild.MakeLabel(_labelTemplate!, host, I18n.T("ui.search"), new Color(0.06f, 0.06f, 0.09f, 1f), 16f, false, false);
                 RectTransform lrt = lblGo.GetComponent<RectTransform>();
                 if (lrt != null) { lrt.anchorMin = new Vector2(0f, 0f); lrt.anchorMax = new Vector2(0f, 1f); lrt.pivot = new Vector2(0f, 0.5f); lrt.sizeDelta = new Vector2(70f, 0f); lrt.anchoredPosition = new Vector2(10f, 0f); }
                 TextMeshProUGUI? lt = lblGo.GetComponent<TextMeshProUGUI>();
                 if (lt != null) { lt.alignment = TextAlignmentOptions.MidlineLeft; try { lt.fontStyle = FontStyles.Bold; } catch { } }
+                _searchLabel = lt;
 
                 // A taller well + text area gives the caret full vertical room (the smoke report: a half-height caret).
                 GameObject inGo = UiBuild.NewRect("MST SearchInput", host);
@@ -1871,7 +2110,7 @@ namespace ModSettingsTool.UI
                 string[] tokens = query.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
                 foreach (ConfigBinding b in all)
                 {
-                    string hay = (b.Key ?? "") + "\n" + (b.DisplayName ?? "") + "\n" + (b.Description ?? "") + "\n" + (b.Section ?? "");
+                    string hay = (b.Key ?? "") + "\n" + (b.DisplayName ?? "") + "\n" + (b.DisplayDescription ?? "") + "\n" + (b.DisplaySection ?? "") + "\n" + (b.Section ?? "");
                     bool ok = true;
                     foreach (string tk in tokens)
                         if (hay.IndexOf(tk, StringComparison.OrdinalIgnoreCase) < 0) { ok = false; break; }
@@ -1890,6 +2129,38 @@ namespace ModSettingsTool.UI
         // against the default without touching the live entry. Refreshes the row marker either way.
         private static void StageOrClear(ConfigBinding b, bool changed, object? effective, Action apply)
         {
+            // No settings-close guard => nothing can ever prompt the player before they leave, so never HOLD an
+            // edit we cannot be asked about: apply it now instead.
+            //
+            // This is the ONLY place anything is added to _staged, so this branch makes "unguarded" and "has
+            // pending edits" mutually exclusive by construction. That matters more than it looks: chasing the
+            // exit paths instead (scene change, quit, alt-F4, crash) is an open-ended enumeration, and the one
+            // guaranteed hook for shutdown is a Unity message this mod has never bound on an injected type,
+            // the rule is to verify before binding, and that cannot be verified without running the game.
+            // Removing the state removes every exit path at once.
+            //
+            // Save/Discard become no-ops in this state, which is honest: Discard was already unreachable
+            // without the close prompt, and every write here is the same reversible ConfigEntry write Save
+            // performs. EffectiveValue falls back to the live entry, so markers and repaints
+            // read correctly with _staged empty.
+            if (!Plugin.CloseGuardActive)
+            {
+                if (changed)
+                {
+                    if (!_unguardedApplyNoted)
+                    {
+                        _unguardedApplyNoted = true;
+                        Plugin.Logger.LogWarning("[ModsTab] the settings-close guard is not active, so edits apply " +
+                                                 "immediately instead of on Save (nothing would prompt before exit).");
+                    }
+                    try { apply(); }
+                    catch (Exception ex) { Plugin.Logger.LogWarning($"[ModsTab] apply '{b.Key}' failed: {ex.Message}"); }
+                }
+                _staged.Remove(b);
+                UpdateMarker(b);
+                return;
+            }
+
             if (changed) _staged[b] = new StagedEdit { Apply = apply, Effective = effective };
             else _staged.Remove(b);
             UpdateMarker(b);
@@ -2163,15 +2434,15 @@ namespace ModSettingsTool.UI
                 Image boxImg = box.AddComponent<Image>();
                 if (boxImg != null) { boxImg.color = new Color(0.13f, 0.13f, 0.16f, 0.98f); boxImg.raycastTarget = true; }
 
-                GameObject msg = UiBuild.MakeLabel(_labelTemplate, box.transform, "You have unsaved mod settings.\nSave them before leaving?", new Color(0.95f, 0.95f, 0.95f, 1f), 18f, true, false);
+                GameObject msg = UiBuild.MakeLabel(_labelTemplate, box.transform, I18n.T("ui.unsavedPrompt"), new Color(0.95f, 0.95f, 0.95f, 1f), 18f, true, false);
                 RectTransform mrt = msg.GetComponent<RectTransform>();
                 if (mrt != null) { mrt.anchorMin = new Vector2(0f, 0.42f); mrt.anchorMax = new Vector2(1f, 1f); mrt.offsetMin = new Vector2(24f, 0f); mrt.offsetMax = new Vector2(-24f, -18f); }
                 TextMeshProUGUI? mtmp = msg.GetComponent<TextMeshProUGUI>();
                 if (mtmp != null) mtmp.alignment = TextAlignmentOptions.Center;
 
-                ModalButton(box.transform, "Save", -178f, new Color(0.22f, 0.55f, 0.32f, 1f), () => { HideModal(); onSave(); });
-                ModalButton(box.transform, "Discard Changes", 0f, new Color(0.60f, 0.32f, 0.30f, 1f), () => { HideModal(); onDiscard(); });
-                ModalButton(box.transform, "Cancel", 178f, new Color(0.30f, 0.30f, 0.36f, 1f), () => { HideModal(); onCancel(); });
+                ModalButton(box.transform, I18n.T("ui.save"), -178f, new Color(0.22f, 0.55f, 0.32f, 1f), () => { HideModal(); onSave(); });
+                ModalButton(box.transform, I18n.T("ui.discardChanges"), 0f, new Color(0.60f, 0.32f, 0.30f, 1f), () => { HideModal(); onDiscard(); });
+                ModalButton(box.transform, I18n.T("ui.cancel"), 178f, new Color(0.30f, 0.30f, 0.36f, 1f), () => { HideModal(); onCancel(); });
             }
             catch (Exception ex)
             {
@@ -2249,6 +2520,9 @@ namespace ModSettingsTool.UI
                 Transform? scrollObj = viewport != null ? viewport.parent : null;
                 if (scrollObj != null) { ScrollRect sr = scrollObj.GetComponent<ScrollRect>(); if (sr != null) sr.enabled = false; }
 
+                RepairCollapsedViewport(viewport);
+                HideInheritedScrollbar(scrollObj, viewport);
+
                 DisableIfPresent<VerticalLayoutGroup>(content);
                 DisableIfPresent<HorizontalLayoutGroup>(content);
                 DisableIfPresent<GridLayoutGroup>(content);
@@ -2265,6 +2539,67 @@ namespace ModSettingsTool.UI
             try { T c = t.GetComponent<T>(); if (c != null) c.enabled = false; } catch { }
         }
 
+        // Right inset the game leaves for a tab's vertical scrollbar (the store window's own healthy viewport
+        // is authored as sizeDelta.x = -17), reused when we have to rebuild a collapsed one.
+        private const float ViewportScrollbarInset = 17f;
+
+        // The cloned tab also brings the game's own vertical scrollbar along, a SIBLING of Viewport under
+        // Scroll, so clearing the tab's content never touched it. It is parked well INSIDE the tab
+        // (anchoredPosition.x = -211 against a right-edge anchor), so once the page renders it reads as a stray
+        // bar floating in the middle of our right pane, on every mod page, whether or not there is anything to
+        // scroll. It also drives nothing: the tab's own ScrollRect is disabled just above, and each of our two
+        // panes scrolls itself (BuildVerticalScroll deliberately builds NO scrollbar, it uses the bottom
+        // "scroll for more" hint instead). So deactivate it on OUR CLONE.
+        //
+        // Scoped to Scroll's DIRECT children, skipping the viewport, so it can never reach a scrollbar that
+        // belongs to our own page content, a cloned TMP_Dropdown's item list carries one of its own.
+        private static void HideInheritedScrollbar(Transform? scrollObj, Transform? viewport)
+        {
+            try
+            {
+                if (scrollObj == null) return;
+                for (int i = 0; i < scrollObj.childCount; i++)
+                {
+                    Transform child;
+                    try { child = scrollObj.GetChild(i); } catch { continue; }
+                    if (child == null || child == viewport) continue;
+                    try { if (child.GetComponent<Scrollbar>() != null) child.gameObject.SetActive(false); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        // Game 1.5.0 ships the MAIN-MENU Settings window's Gameplay tab, the tab we clone as our template
+        // source, with a COLLAPSED scroll viewport: anchorMin == anchorMax == (0,0) and sizeDelta 0x0, where
+        // the store window's copy of the same tab is properly stretched (anchors 0,0-1,1, sizeDelta -17x0).
+        // Cloning that tab inherited the zero-size viewport, and the mask on it clipped our entire two-pane
+        // page away: the main-menu Mods tab opened blank, with only the cloned scrollbar still drawing at the
+        // right edge (it is a SIBLING of Viewport under Scroll, so it keeps a real rect). Stretch OUR CLONE's
+        // viewport back over its Scroll parent so the page always lays out against a real rect, whatever
+        // shape the source tab was in. The test reads the serialized anchors rather than .rect because the
+        // clone is still inactive at this point; a healthy viewport is left untouched.
+        private static void RepairCollapsedViewport(Transform? viewport)
+        {
+            try
+            {
+                if (viewport == null) return;
+                RectTransform? rt = viewport.GetComponent<RectTransform>();
+                if (rt == null) return;
+
+                Vector2 aMin = rt.anchorMin, aMax = rt.anchorMax, size = rt.sizeDelta;
+                bool flatX = Mathf.Approximately(aMin.x, aMax.x) && size.x <= 1f;
+                bool flatY = Mathf.Approximately(aMin.y, aMax.y) && size.y <= 1f;
+                if (!flatX && !flatY) return;   // the store window's shape, nothing to do
+
+                rt.anchorMin = Vector2.zero;
+                rt.anchorMax = Vector2.one;
+                rt.offsetMin = Vector2.zero;
+                rt.offsetMax = new Vector2(-ViewportScrollbarInset, 0f);
+                Plugin.Logger.LogInfo("[ModsTab] source tab had a collapsed scroll viewport; stretched our clone's copy so the page can render.");
+            }
+            catch { }
+        }
+
         // The dropdown row's own title label = the first TMP that is NOT inside the dropdown (whose caption /
         // item-template labels live under dd.transform).
         private static TextMeshProUGUI? RowTitle(GameObject row, TMP_Dropdown? dd)
@@ -2278,7 +2613,11 @@ namespace ModSettingsTool.UI
             return null;
         }
 
-        private static string KeyName(object? v) => v == null ? "None" : (v.ToString() ?? "None");
+        private static string KeyName(object? v)
+        {
+            string raw = v == null ? "None" : (v.ToString() ?? "None");
+            return string.Equals(raw, "None", StringComparison.OrdinalIgnoreCase) ? I18n.T("ui.keyNone") : raw;
+        }
 
         private static void EndCapture()
         {
@@ -2339,6 +2678,26 @@ namespace ModSettingsTool.UI
             {
                 WindowTab? t = arr[i];
                 if (t != null && t.TabName == TabName) return true;
+            }
+            return false;
+        }
+
+        // Does ANY tab have content rows yet? Deliberately reads only child counts, no component lookups,
+        // so a poll against an unopened/unpopulated settings window stays trivial. This is the line between
+        // "nothing to do yet" (free, uncharged, retry later) and a real attempt worth charging.
+        private static bool AnyTabPopulated(Il2CppReferenceArray<WindowTab>? tabs)
+        {
+            if (tabs == null) return false;
+            for (int i = 0; i < tabs.Length; i++)
+            {
+                WindowTab? t = tabs[i];
+                if (t == null) continue;
+                try
+                {
+                    Transform? content = ContentOf(t);
+                    if (content != null && content.childCount > 0) return true;
+                }
+                catch { }
             }
             return false;
         }
@@ -2440,15 +2799,17 @@ namespace ModSettingsTool.UI
             tabs.m_Tabs = grown;
         }
 
+        private static bool TaskbarReady(TabManager tabs)
+        {
+            try { return TaskbarButtonTemplate(tabs) != null; }
+            catch { return false; }
+        }
+
         private static GameObject? AddTaskbarButton(TabManager tabs, WindowTab tab)
         {
-            Transform? windowBg = tabs.transform.parent;
-            Transform? taskbar = windowBg != null ? windowBg.Find("Taskbar") : null;
-            if (taskbar == null || taskbar.childCount == 0) return null;
-
-            Transform buttonsRow = taskbar.GetChild(0);
-            if (buttonsRow.childCount == 0) return null;
-            GameObject template = buttonsRow.GetChild(0).gameObject;
+            GameObject? template = TaskbarButtonTemplate(tabs);
+            if (template == null || template.transform == null || template.transform.parent == null) return null;
+            Transform buttonsRow = template.transform.parent;
 
             // The buttons sit in a GridLayoutGroup; a new button would wrap to a second row. Pin to one row.
             try
@@ -2470,12 +2831,23 @@ namespace ModSettingsTool.UI
             {
                 LocalizeStringEvent? loc = label.GetComponent<LocalizeStringEvent>();
                 if (loc != null) loc.enabled = false;
-                label.text = "Mods";
+                label.text = I18n.T("ui.tab.mods");
             }
 
             Button? btn = button.GetComponent<Button>();
             if (btn != null) UiListeners.OnClick(btn, () => { try { tabs.OpenTab(TabName); } catch { } });
             return button;
+        }
+
+        private static GameObject? TaskbarButtonTemplate(TabManager tabs)
+        {
+            Transform? windowBg = tabs.transform.parent;
+            Transform? taskbar = windowBg != null ? windowBg.Find("Taskbar") : null;
+            if (taskbar == null || taskbar.childCount == 0) return null;
+
+            Transform buttonsRow = taskbar.GetChild(0);
+            if (buttonsRow.childCount == 0) return null;
+            return buttonsRow.GetChild(0).gameObject;
         }
 
         // ── cloned controls (Toggle / Slider, proven, unchanged) ─────────────────────────────────────
@@ -2546,7 +2918,7 @@ namespace ModSettingsTool.UI
                 Slider? slider = go.GetComponentInChildren<Slider>(true);
                 if (slider != null)
                 {
-                    // CRITICAL ORDER (MST-RULE-12 + no spurious staging): FIRST drop the source's PERSISTENT
+                    // CRITICAL ORDER (no spurious staging): FIRST drop the source's PERSISTENT
                     // onValueChanged (e.g. SetSensitivity) by replacing the event with an empty one, so the next
                     // lines can't fire it and corrupt a real game setting. THEN set range/value: Unity fires
                     // onValueChanged when it clamps the old cloned value into the new range, but the event is
